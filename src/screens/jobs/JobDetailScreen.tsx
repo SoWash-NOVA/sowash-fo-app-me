@@ -10,7 +10,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
-  View
+  View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import Toast from "react-native-toast-message";
@@ -25,63 +25,35 @@ export default function JobDetailScreen({ route, navigation }: any) {
   const [startingJob, setStartingJob] = useState(false);
 
   useEffect(() => {
-    if (jobId) {
-      fetchJobDetails();
-    } else {
+    if (!jobId) {
       Alert.alert("Error", "No Job ID provided.");
       navigation.goBack();
+      return;
     }
-  }, [jobId]);
 
-  const fetchJobDetails = async () => {
-    try {
-      setLoading(true);
-
-      const response = await apiClient.get(`/jobs/${jobId}`);
-
-      let jobData = response.data.data || response.data;
-      if (Array.isArray(jobData)) {
-        jobData = jobData[0];
+    const fetchJobDetails = async () => {
+      try {
+        setLoading(true);
+        const response = await apiClient.get(`/jobs/${jobId}`);
+        setJob(response.data);
+      } catch (error: any) {
+        console.error("Job Fetch Error:", error);
+        Toast.show({
+          type: "error",
+          text1: "Sync Error",
+          text2: "Could not load job details.",
+        });
+      } finally {
+        setLoading(false);
       }
+    };
 
-      setJob(jobData);
-    } catch (error: any) {
-      console.error("Job Fetch Error:", error);
-      Toast.show({
-        type: "error",
-        text1: "Sync Error",
-        text2: "Could not load job details.",
-      });
-    } finally {
-      setLoading(false);
-    }
-  };
+    fetchJobDetails();
+  }, [jobId, navigation]);
 
-  const handleStartJob = async () => {
-    try {
-      setStartingJob(true);
-
-      await apiClient.patch(`/jobs/${jobId}/status`, {
-        status: "in_progress",
-      });
-
-      Toast.show({
-        type: "success",
-        text1: "Job Started",
-        text2: "Job marked as In Progress.",
-      });
-
-      Alert.alert("Success", "Navigating to Diagram Before Screen...");
-    } catch (error: any) {
-      console.error("Status Update Error:", error);
-      Toast.show({
-        type: "error",
-        text1: "Action Failed",
-        text2: "Could not start the job.",
-      });
-    } finally {
-      setStartingJob(false);
-    }
+  // Replace handleStartJob with this:
+  const handleViewJob = () => {
+    navigation.navigate("SLDMap", { jobId, diagram: job.diagram });
   };
 
   if (loading) {
@@ -95,19 +67,37 @@ export default function JobDetailScreen({ route, navigation }: any) {
 
   if (!job) return null;
 
-  const safeId = job.id || job.job_id || jobId;
-  const safeSiteName = job.site_name || "Site Name Not Provided";
-  const safeClientName = job.client_name || "Client Not Provided";
-  const safeDate = job.scheduled_date || "Date Pending";
-  const teamMembers = Array.isArray(job.team_members)
-    ? job.team_members.join(", ")
-    : job.team_members || "Team Not Assigned";
-  const adminNotes = job.admin_notes || "No notes for this site.";
+  const safeId = job.job?.id || jobId;
+  const safeSiteName = job.job?.site_name || "Site Name Not Provided";
+  const safeClientName = job.job?.client_name || "Client Not Provided";
+  const safeDate = job.job?.scheduled_date
+    ? new Date(job.job.scheduled_date).toLocaleDateString()
+    : "Date Pending";
+  const safeTime = job.job?.scheduled_time || "";
+  const safePanelCount = job.job?.panel_count ?? "—";
+  const safeSystemSize = job.job?.system_size ?? "—";
+  const safeLocation = job.job?.location || "—";
+  const safeTeamName = job.job?.team_name || "—";
+  const teamMembers =
+    Array.isArray(job.members) && job.members.length > 0
+      ? job.members
+          .map(
+            (m: any) =>
+              `${m.firstname} ${m.lastname}${m.role === "lead" ? " (Lead)" : ""}`
+          )
+          .join(", ")
+      : "Team Not Assigned";
+  const adminNotes =
+    Array.isArray(job.notes) && job.notes.length > 0
+      ? job.notes.map((n: any) => n.note || n).join("\n")
+      : "No notes for this site.";
+  const hasDiagram = !!job.diagram;
 
   return (
     <LinearGradient colors={["#080C18", "#0D1120"]} style={styles.container}>
       <StatusBar barStyle="light-content" />
       <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}>
+        {/* Header */}
         <View style={styles.header}>
           <TouchableOpacity
             onPress={() => navigation.goBack()}
@@ -126,33 +116,82 @@ export default function JobDetailScreen({ route, navigation }: any) {
           contentContainerStyle={styles.scrollContent}
           showsVerticalScrollIndicator={false}
         >
+          {/* Site Information */}
           <BlurView intensity={30} tint="dark" style={styles.card}>
             <View style={styles.cardHeader}>
               <Ionicons name="business" size={20} color="#0EA5E9" />
               <Text style={styles.cardTitle}>SITE INFORMATION</Text>
             </View>
             <View style={styles.infoRow}>
-              <Text style={styles.label}>Site Name:</Text>
+              <Text style={styles.label}>Site Name</Text>
               <Text style={styles.value}>{safeSiteName}</Text>
             </View>
             <View style={styles.infoRow}>
-              <Text style={styles.label}>Client:</Text>
+              <Text style={styles.label}>Client</Text>
               <Text style={styles.value}>{safeClientName}</Text>
             </View>
             <View style={styles.infoRow}>
-              <Text style={styles.label}>Scheduled:</Text>
-              <Text style={styles.value}>{safeDate}</Text>
+              <Text style={styles.label}>Location</Text>
+              <Text style={styles.value}>{safeLocation}</Text>
+            </View>
+            <View style={styles.infoRow}>
+              <Text style={styles.label}>Scheduled</Text>
+              <Text style={styles.value}>
+                {safeDate}{safeTime ? `  ${safeTime}` : ""}
+              </Text>
+            </View>
+            <View style={styles.infoRow}>
+              <Text style={styles.label}>Panel Count</Text>
+              <Text style={styles.value}>{safePanelCount}</Text>
+            </View>
+            <View style={[styles.infoRow, { marginBottom: 0 }]}>
+              <Text style={styles.label}>System Size</Text>
+              <Text style={styles.value}>{safeSystemSize} kW</Text>
             </View>
           </BlurView>
 
+          {/* Team */}
           <BlurView intensity={30} tint="dark" style={styles.card}>
             <View style={styles.cardHeader}>
               <Ionicons name="people" size={20} color="#0EA5E9" />
-              <Text style={styles.cardTitle}>TEAM MEMBERS</Text>
+              <Text style={styles.cardTitle}>TEAM</Text>
             </View>
-            <Text style={styles.value}>{teamMembers}</Text>
+            <View style={styles.infoRow}>
+              <Text style={styles.label}>Team Name</Text>
+              <Text style={styles.value}>{safeTeamName}</Text>
+            </View>
+            <View style={[styles.infoRow, { marginBottom: 0 }]}>
+              <Text style={styles.label}>Members</Text>
+              <Text style={[styles.value, { flexShrink: 1 }]}>{teamMembers}</Text>
+            </View>
           </BlurView>
 
+          {/* Diagram status */}
+          <BlurView intensity={30} tint="dark" style={styles.card}>
+            <View style={styles.cardHeader}>
+              <Ionicons name="map" size={20} color="#0EA5E9" />
+              <Text style={styles.cardTitle}>SITE DIAGRAM</Text>
+            </View>
+            <View style={styles.diagramRow}>
+              <Ionicons
+                name={hasDiagram ? "checkmark-circle" : "close-circle"}
+                size={20}
+                color={hasDiagram ? "#22D3A5" : "#EF4444"}
+              />
+              <Text
+                style={[
+                  styles.diagramText,
+                  { color: hasDiagram ? "#22D3A5" : "#EF4444" },
+                ]}
+              >
+                {hasDiagram
+                  ? `${job.diagram.title} — ${job.diagram.points?.length ?? 0} pins loaded`
+                  : "No diagram assigned to this site"}
+              </Text>
+            </View>
+          </BlurView>
+
+          {/* Admin Notes */}
           <BlurView
             intensity={30}
             tint="dark"
@@ -168,20 +207,13 @@ export default function JobDetailScreen({ route, navigation }: any) {
           </BlurView>
         </ScrollView>
 
+        {/* CTA */}
         <View style={styles.ctaContainer}>
-          <TouchableOpacity
-            style={[styles.startBtn, startingJob && styles.startBtnDisabled]}
-            onPress={handleStartJob}
-            disabled={startingJob}
-          >
-            {startingJob ? (
-              <ActivityIndicator color="#080C18" />
-            ) : (
-              <View style={styles.btnContent}>
-                <Text style={styles.startBtnText}>START JOB</Text>
-                <Ionicons name="play" size={20} color="#080C18" />
-              </View>
-            )}
+          <TouchableOpacity style={styles.startBtn} onPress={handleViewJob}>
+            <View style={styles.btnContent}>
+              <Text style={styles.startBtnText}>VIEW JOB</Text>
+              <Ionicons name="arrow-forward" size={20} color="#080C18" />
+            </View>
           </TouchableOpacity>
         </View>
       </SafeAreaView>
@@ -270,6 +302,16 @@ const styles = StyleSheet.create({
     flex: 1,
     textAlign: "right",
     marginLeft: 20,
+  },
+  diagramRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  diagramText: {
+    fontSize: 14,
+    fontWeight: "bold",
+    flexShrink: 1,
   },
   alertCard: {
     borderColor: "rgba(245, 158, 11, 0.4)",

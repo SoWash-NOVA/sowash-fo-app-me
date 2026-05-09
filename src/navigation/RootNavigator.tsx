@@ -1,14 +1,14 @@
-import DrawerNavigator from './DrawerNavigator';
-import React, { useEffect } from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import React, { useEffect } from 'react';
 import Toast from 'react-native-toast-message';
+import DrawerNavigator from './DrawerNavigator';
 
-import { useAuthStore } from '../store/authStore'; 
-import { navigationRef } from './navigationRef'; 
+import { useAuthStore } from '../store/authStore';
+import { navigationRef } from './navigationRef';
 
+import FSRScreen from '../screens/FSRScreen';
 import LoginScreen from '../screens/LoginScreen';
-import DashboardScreen from '../screens/DashboardScreen';
 import SLDMapScreen from '../screens/SLDMapScreen';
 
 const Stack = createNativeStackNavigator();
@@ -38,6 +38,7 @@ export default function RootNavigator() {
                 
                 {/* SLDMap stays outside the drawer so it can slide ON TOP of it with a back button */}
                 <Stack.Screen name="SLDMap" component={SLDMapScreen} />
+                <Stack.Screen name="FSRScreen" component={FSRScreen} />
                 </>
             )}
             </Stack.Navigator>
