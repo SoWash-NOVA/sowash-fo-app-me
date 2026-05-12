@@ -216,7 +216,7 @@ export default function FSRScreen() {
       }).catch(() => {});
 
       Toast.show({ type: "success", text1: "Job Completed!", text2: "FSR submitted successfully." });
-      navigation.navigate("JobOrders");
+      navigation.reset({ index: 0, routes: [{ name: "MainDrawer" as any }] });
     } catch (e: any) {
       Toast.show({ type: "error", text1: "Submission Failed", text2: e?.message ?? "Check connection and try again." });
     } finally {
