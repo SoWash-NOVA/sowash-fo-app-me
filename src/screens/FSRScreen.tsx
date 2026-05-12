@@ -3,20 +3,20 @@ import { RouteProp, useNavigation, useRoute } from "@react-navigation/native";
 import * as SecureStore from "expo-secure-store";
 import React, { useRef, useState } from "react";
 import {
-    ActivityIndicator,
-    Alert,
-    KeyboardAvoidingView,
-    Modal,
-    Platform,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  Alert,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import SignatureScreen, {
-    SignatureViewRef,
+  SignatureViewRef,
 } from "react-native-signature-canvas";
 import Toast from "react-native-toast-message";
 
