@@ -8,15 +8,18 @@ import {
 import React from "react";
 import { Image, Platform, StyleSheet, Text, View } from "react-native";
 import { useAuthStore } from "../store/authStore";
+
 // Import our existing screens
 import Compliance from "../screens/Compliance";
 import DashboardScreen from "../screens/DashboardScreen";
+import DeviceHistory from "../screens/DeviceAttendanceLogScreen";
 import MarkAttendanceScreen from "../screens/MarkAttendanceScreen";
 import JobDetailScreen from "../screens/jobs/JobDetailScreen";
-// Temporary Placeholders for the screens we are about to build step-by-step
+
+// Temporary Placeholders
 const PlaceholderScreen = ({ route }: any) => (
   <View style={styles.placeholderContainer}>
-    <Ionicons name="construct-outline" size={64} color="#3B82F6" />
+    <Ionicons name="construct-outline" size={64} color="#0EA5E9" />
     <Text style={styles.placeholderText}>BUILDING MODULE: {route.name}</Text>
   </View>
 );
@@ -34,13 +37,12 @@ function CustomDrawerContent(props: any) {
         contentContainerStyle={{ paddingTop: 0 }}
         showsVerticalScrollIndicator={false}
       >
-        {/* Blended Sleek Dark Header from your previous app + NOVAA Theme */}
         <View style={styles.drawerHeader}>
           <View style={styles.headerOverlay} />
           <View style={styles.logoWrapper}>
             <View style={styles.logoGlow} />
             <View style={styles.logoContainer}>
-              {/* Update this path if your logo is somewhere else */}
+              {/* Ensure this path matches your logo location! */}
               <Image
                 source={require("../../assets/images/icon.png")}
                 style={styles.logo}
@@ -51,18 +53,15 @@ function CustomDrawerContent(props: any) {
           <Text style={styles.appTitle}>NOVAA FIELD OPERATOR</Text>
         </View>
 
-        {/* Navigation Label */}
         <View style={styles.navSection}>
           <Text style={styles.sectionLabel}>SYSTEM NAVIGATION</Text>
         </View>
 
-        {/* Standard Navigation Links */}
         <View style={styles.linkContainer}>
           <DrawerItemList {...props} />
         </View>
       </DrawerContentScrollView>
 
-      {/* Premium Footer with Status Indicator */}
       <View style={styles.footer}>
         <View style={styles.footerDivider} />
         <View style={styles.footerContent}>
@@ -73,7 +72,6 @@ function CustomDrawerContent(props: any) {
           </View>
         </View>
 
-        {/* Terminate Session Button */}
         <DrawerItem
           label="TERMINATE SESSION"
           labelStyle={styles.logoutText}
@@ -96,12 +94,12 @@ export default function DrawerNavigator() {
         headerShown: false,
         drawerStyle: {
           backgroundColor: "#050B14",
-          width: 300, // Slightly wider for the new layout
+          width: 300,
           borderRightWidth: 1,
-          borderColor: "rgba(59, 130, 246, 0.2)", // Blue glow border
+          borderColor: "rgba(14, 165, 233, 0.2)",
         },
-        drawerActiveBackgroundColor: "rgba(59, 130, 246, 0.15)",
-        drawerActiveTintColor: "#60A5FA", // Light Neon Blue
+        drawerActiveBackgroundColor: "rgba(14, 165, 233, 0.15)",
+        drawerActiveTintColor: "#0EA5E9",
         drawerInactiveTintColor: "#64748B",
         drawerItemStyle: {
           borderRadius: 10,
@@ -115,7 +113,7 @@ export default function DrawerNavigator() {
         },
       }}
     >
-      {/* 1. Job Orders (Current Dashboard) */}
+      {/* 1. Job Orders */}
       <Drawer.Screen
         name="JobOrders"
         component={DashboardScreen}
@@ -127,19 +125,7 @@ export default function DrawerNavigator() {
         }}
       />
 
-      {/* 5. Connect Device Tracker */}
-      <Drawer.Screen
-        name="ConnectDevice"
-        component={PlaceholderScreen}
-        options={{
-          title: "Connect Wrist Band",
-          drawerIcon: ({ color, size }) => (
-            <Ionicons name="bluetooth-outline" size={size} color={color} />
-          ),
-        }}
-      />
-
-      {/* 7. Mark Attendance */}
+      {/* 2. Mark Attendance */}
       <Drawer.Screen
         name="MarkAttendance"
         component={MarkAttendanceScreen}
@@ -151,16 +137,19 @@ export default function DrawerNavigator() {
         }}
       />
 
+      {/* 3. Device Ledger / History (NEW!) */}
       <Drawer.Screen
-        name="JobDetail"
-        component={JobDetailScreen}
+        name="DeviceHistory"
+        component={DeviceHistory}
         options={{
-          drawerItemStyle: { display: "none" }, // This hides it from the sidebar!
-          headerShown: false,
+          title: "Local Scan Ledger",
+          drawerIcon: ({ color, size }) => (
+            <Ionicons name="time-outline" size={size} color={color} />
+          ),
         }}
       />
 
-      {/* 8. Compliance */}
+      {/* 4. Compliance */}
       <Drawer.Screen
         name="Compliance"
         component={Compliance}
@@ -176,7 +165,19 @@ export default function DrawerNavigator() {
         }}
       />
 
-      {/* 9. Change Password */}
+      {/* 5. Connect Device */}
+      <Drawer.Screen
+        name="ConnectDevice"
+        component={PlaceholderScreen}
+        options={{
+          title: "Connect Wrist Band",
+          drawerIcon: ({ color, size }) => (
+            <Ionicons name="bluetooth-outline" size={size} color={color} />
+          ),
+        }}
+      />
+
+      {/* 6. Change Password */}
       <Drawer.Screen
         name="ChangePassword"
         component={PlaceholderScreen}
@@ -187,74 +188,95 @@ export default function DrawerNavigator() {
           ),
         }}
       />
+
+      {/* HIDDEN SCREENS (No display in sidebar) */}
+      <Drawer.Screen
+        name="JobDetail"
+        component={JobDetailScreen}
+        options={{
+          drawerItemStyle: { display: "none" }, // Hidden!
+        }}
+      />
     </Drawer.Navigator>
   );
 }
 
+// ── MISSING STYLES RE-ADDED ──────────────────────────────────────────────────
 const styles = StyleSheet.create({
+  placeholderContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "#080C18",
+  },
+  placeholderText: {
+    color: "#0EA5E9",
+    marginTop: 16,
+    fontWeight: "bold",
+    letterSpacing: 1,
+  },
+
   drawerContainer: { flex: 1, backgroundColor: "#050B14" },
   drawerHeader: {
-    paddingTop: Platform.OS === "ios" ? 60 : 40,
+    padding: 20,
+    paddingTop: Platform.OS === "android" ? 50 : 40,
     paddingBottom: 30,
     alignItems: "center",
-    backgroundColor: "#0A0F1E",
     borderBottomWidth: 1,
-    borderBottomColor: "rgba(59, 130, 246, 0.2)",
-    position: "relative",
+    borderBottomColor: "rgba(14, 165, 233, 0.2)",
   },
   headerOverlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: "#1E40AF",
-    opacity: 0.05,
+    backgroundColor: "rgba(14, 165, 233, 0.05)",
   },
   logoWrapper: { position: "relative", marginBottom: 16 },
   logoGlow: {
     position: "absolute",
-    width: 100,
-    height: 100,
-    borderRadius: 50,
-    backgroundColor: "#3B82F6",
-    opacity: 0.2,
     top: -10,
     left: -10,
+    right: -10,
+    bottom: -10,
+    backgroundColor: "rgba(14, 165, 233, 0.2)",
+    borderRadius: 50,
   },
   logoContainer: {
     width: 80,
     height: 80,
     borderRadius: 40,
-    backgroundColor: "#1E293B",
+    backgroundColor: "#080C18",
     justifyContent: "center",
     alignItems: "center",
-    borderWidth: 2,
-    borderColor: "#334155",
-    zIndex: 1,
+    borderWidth: 1,
+    borderColor: "rgba(14, 165, 233, 0.5)",
   },
   logo: { width: 50, height: 50 },
   appTitle: {
+    color: "#F8FAFC",
     fontSize: 16,
     fontWeight: "900",
-    color: "#FFFFFF",
-    letterSpacing: 3,
-  },
-  navSection: { paddingHorizontal: 20, paddingTop: 20, paddingBottom: 10 },
-  sectionLabel: {
-    fontSize: 10,
-    fontWeight: "bold",
-    color: "#475569",
     letterSpacing: 2,
   },
-  linkContainer: { paddingBottom: 20 },
-  footer: { padding: 16, paddingBottom: Platform.OS === "ios" ? 40 : 20 },
+
+  navSection: { paddingHorizontal: 20, paddingTop: 24, paddingBottom: 8 },
+  sectionLabel: {
+    color: "#64748B",
+    fontSize: 10,
+    fontWeight: "800",
+    letterSpacing: 1.5,
+  },
+  linkContainer: { paddingHorizontal: 8 },
+
+  footer: { padding: 20, paddingBottom: Platform.OS === "android" ? 30 : 40 },
   footerDivider: {
     height: 1,
-    backgroundColor: "rgba(255, 255, 255, 0.1)",
-    marginBottom: 16,
+    backgroundColor: "rgba(14, 165, 233, 0.2)",
+    marginBottom: 20,
   },
   footerContent: {
     flexDirection: "row",
     alignItems: "center",
     marginBottom: 20,
-    paddingHorizontal: 8,
+    paddingHorizontal: 10,
   },
   statusIndicator: {
     width: 8,
@@ -264,35 +286,21 @@ const styles = StyleSheet.create({
     marginRight: 12,
     shadowColor: "#10B981",
     shadowOpacity: 0.8,
-    shadowRadius: 4,
+    shadowRadius: 6,
   },
-  statusText: { fontSize: 12, fontWeight: "bold", color: "#E2E8F0" },
-  versionText: {
-    fontSize: 10,
-    color: "#475569",
-    marginTop: 2,
-    fontFamily: Platform.OS === "ios" ? "Courier" : "monospace",
+  statusText: {
+    color: "#10B981",
+    fontSize: 12,
+    fontWeight: "800",
+    letterSpacing: 1,
   },
+  versionText: { color: "#64748B", fontSize: 10, marginTop: 2 },
+
   logoutButton: {
     backgroundColor: "rgba(239, 68, 68, 0.1)",
     borderRadius: 10,
     borderWidth: 1,
     borderColor: "rgba(239, 68, 68, 0.3)",
-    marginTop: 10,
   },
-  logoutText: { color: "#EF4444", fontWeight: "bold", letterSpacing: 1 },
-
-  // Styles for the temporary placeholders
-  placeholderContainer: {
-    flex: 1,
-    backgroundColor: "#050B14",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  placeholderText: {
-    color: "#64748B",
-    marginTop: 16,
-    fontWeight: "bold",
-    letterSpacing: 2,
-  },
+  logoutText: { color: "#EF4444", fontWeight: "800", letterSpacing: 1 },
 });

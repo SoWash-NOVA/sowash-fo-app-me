@@ -1,67 +1,73 @@
-import axios from 'axios';
-import * as SecureStore from 'expo-secure-store';
-import Toast from 'react-native-toast-message';
-import { navigate } from '../navigation/navigationRef';
-import { useAuthStore } from '../store/authStore';
+import axios from "axios";
+import * as SecureStore from "expo-secure-store";
+import Toast from "react-native-toast-message";
+import { useAuthStore } from "../store/authStore";
 
-// IMPORTANT: Replace these with your computer's local Wi-Fi IP during testing
-// For production, change back to: https://app.sowashusa.com/api/mideast
-const API_BASE_URL = 'https://app.sowashusa.com/api/mideast'; 
-const FACE_API_URL = 'http://192.168.1.100:5001/';
+const API_BASE_URL = "https://app.sowashusa.com/api/mideast";
+const CORE_API_URL = "https://app.sowashusa.com/api/"; // 🚀 Root API for global Attendance
+const FACE_API_URL = "http://app.sowashusa.com:5001/";
 
-// 1. Standard API Gateway Instance
+// 1. Mideast API Gateway (Jobs, Annotations, etc.)
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
   timeout: 10000,
 });
 
-// 2. Face Recognition Instance (Processing Heavy Images)
+// 2. Core API Gateway (Global Attendance)
+export const coreApiClient = axios.create({
+  baseURL: CORE_API_URL,
+  timeout: 10000,
+});
+
+// 3. Face Recognition Instance (Processing Heavy Images)
 export const faceInstance = axios.create({
   baseURL: FACE_API_URL,
-  timeout: 45000, 
+  timeout: 45000,
   headers: {
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
   },
 });
 
-// Interceptor to attach the secure token to every standard request
-apiClient.interceptors.request.use(
-  async (config) => {
-    try {
-      // Using SecureStore for enhanced security (replacing AsyncStorage)
-      const token = await SecureStore.getItemAsync('userToken');
-      if (token) {
-        config.headers.Authorization = `Bearer ${token}`;
-      }
-    } catch (error) {
-      console.error('SecureStore Error:', error);
+// ── Interceptors ─────────────────────────────────────────────────────────────
+
+const attachToken = async (config: any) => {
+  try {
+    const token = await SecureStore.getItemAsync("userToken");
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
     }
-    return config;
-  },
-  (error) => Promise.reject(error)
-);
-
-// Handle 401 errors globally
-// Handle 401 errors globally
-apiClient.interceptors.response.use(
-  (response) => response,
-  async (error) => {
-    if (error.response?.status === 401) {
-      // Show toast notification
-      Toast.show({
-        type: 'error',
-        text1: 'Session Expired',
-        text2: 'Please log in again.',
-      });
-
-      // Instantly trigger global logout. 
-      // This deletes the SecureStore token AND switches the screen automatically!
-      useAuthStore.getState().logout();
-    }
-
-    return Promise.reject(error);
+  } catch (error) {
+    console.error("SecureStore Error:", error);
   }
+  return config;
+};
+
+const handleAuthError = async (error: any) => {
+  if (error.response?.status === 401) {
+    Toast.show({
+      type: "error",
+      text1: "Session Expired",
+      text2: "Please log in again.",
+    });
+    useAuthStore.getState().logout();
+  }
+  return Promise.reject(error);
+};
+
+// Apply security rules to Mideast Client
+apiClient.interceptors.request.use(attachToken, (error) =>
+  Promise.reject(error),
+);
+apiClient.interceptors.response.use((response) => response, handleAuthError);
+
+// Apply security rules to Core Client (Attendance)
+coreApiClient.interceptors.request.use(attachToken, (error) =>
+  Promise.reject(error),
+);
+coreApiClient.interceptors.response.use(
+  (response) => response,
+  handleAuthError,
 );
 
 export default apiClient;
