@@ -1,6 +1,10 @@
 import { Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { useFocusEffect } from "@react-navigation/native";
+import { BlurView } from "expo-blur";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { LinearGradient } from "expo-linear-gradient";
+import * as Network from "expo-network";
 import * as SecureStore from "expo-secure-store";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -11,6 +15,7 @@ import {
   KeyboardAvoidingView,
   Modal,
   Platform,
+  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
@@ -27,7 +32,15 @@ const TABS = ["BEFORE", "ANNOTATE", "AFTER"] as const;
 type Tab = (typeof TABS)[number];
 
 export const SERVER_BASE = "https://app.sowashusa.com";
+const REQUIRED_WAIT_SECONDS = 10 * 60;
+const OFFLINE_QUEUE_KEY = "@sowash_offline_queue";
 
+type QueuedAction = {
+  id: string;
+  type: "EVENT" | "PHOTO" | "ANNOTATION" | "TPT";
+  jobId: string;
+  payload: any;
+};
 const STATUS_TO_STEP: Record<string, number> = {
   scheduled: -1,
   in_progress: -1,
@@ -37,7 +50,6 @@ const STATUS_TO_STEP: Record<string, number> = {
   work_finished: 3,
   completed: 4,
 };
-
 const EVENT_TO_STEP: Record<string, number> = {
   reached_site: 0,
   reached_panels: 1,
@@ -46,32 +58,18 @@ const EVENT_TO_STEP: Record<string, number> = {
   site_exited: 4,
 };
 
-const STEP_DEFS = [
-  { key: "reached_site", label: "Reached\nSite", icon: "location-outline" },
-  { key: "reached_panels", label: "At\nPanels", icon: "grid-outline" },
-  { key: "work_started", label: "Work\nStarted", icon: "play-circle-outline" },
-  {
-    key: "work_finished",
-    label: "Work\nFinished",
-    icon: "checkmark-circle-outline",
-  },
-  { key: "site_exited", label: "Site\nExited", icon: "exit-outline" },
-] as const;
-
 type Point = {
   id: number;
   label?: string;
   x_percent: number;
   y_percent: number;
 };
-
 type StringShape = {
   id: number;
   label: string;
   color: string;
   points: Array<{ x: number; y: number }>;
 };
-
 type PinStatus = {
   beforeUri?: string;
   beforeUploaded: boolean;
@@ -97,37 +95,21 @@ export default function SLDMapScreen({ navigation, route }: any) {
   const [imageLoading, setImageLoading] = useState(true);
 
   const [jobStep, setJobStep] = useState(-1);
-  const [stepLoading, setStepLoading] = useState(true);
   const [firingEvent, setFiringEvent] = useState(false);
-  const workStartedFired = useRef(false);
-  const workFinishedFired = useRef(false);
+  const currentJobIdRef = useRef<string | null>(null);
+  const [fsrDone, setFsrDone] = useState(false);
+  const [gateTime, setGateTime] = useState<number | null>(null);
+  const [timeRemaining, setTimeRemaining] = useState(REQUIRED_WAIT_SECONDS);
 
-  // ── TPT Photo ─────────────────────────────────────────────────────────────
-  const [tptUploaded, setTptUploaded] = useState(false);
-  const [tptUri, setTptUri] = useState<string | null>(null);
-  const [showTptCamera, setShowTptCamera] = useState(false);
-  const [tptUploading, setTptUploading] = useState(false);
-  const tptCameraRef = useRef<CameraView>(null);
+  const [phase, setPhase] = useState<
+    "overview" | "at_gate" | "at_panel" | "completed"
+  >("overview");
 
-  // ── String overlays ───────────────────────────────────────────────────────
   const [jobStrings, setJobStrings] = useState<StringShape[]>([]);
-  const [jobStringFlags, setJobStringFlags] = useState<number[]>([]); // flagged string IDs
+  const [jobStringFlags, setJobStringFlags] = useState<number[]>([]);
   const pulseAnim = useRef(new Animated.Value(0)).current;
 
-  const [pinStatuses, setPinStatuses] = useState<Record<number, PinStatus>>(
-    () => {
-      const initial: Record<number, PinStatus> = {};
-      for (const p of (diagram?.points ?? []) as Point[]) {
-        initial[p.id] = {
-          beforeUploaded: false,
-          annotationSaved: false,
-          afterUploaded: false,
-        };
-      }
-      return initial;
-    },
-  );
-
+  const [pinStatuses, setPinStatuses] = useState<Record<number, PinStatus>>({});
   const [selectedPin, setSelectedPin] = useState<Point | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("BEFORE");
   const [note, setNote] = useState("");
@@ -141,15 +123,39 @@ export default function SLDMapScreen({ navigation, route }: any) {
   );
   const cameraRef = useRef<CameraView>(null);
 
-  // ─── Mount ────────────────────────────────────────────────────────────────
+  const [offlineQueue, setOfflineQueue] = useState<QueuedAction[]>([]);
+  const [isSyncing, setIsSyncing] = useState(false);
 
+  // ─── INIT & RESET ───
+  // ─── INIT & RESET ───
   useEffect(() => {
+    if (!jobId) return;
+
+    if (currentJobIdRef.current !== jobId) {
+      setGateTime(null);
+      setTimeRemaining(REQUIRED_WAIT_SECONDS);
+      setSelectedPin(null);
+      setShowCamera(false);
+      setPhase("overview");
+
+      const initialPins: Record<number, PinStatus> = {};
+      for (const p of (diagram?.points ?? []) as Point[]) {
+        initialPins[p.id] = {
+          beforeUploaded: false,
+          annotationSaved: false,
+          afterUploaded: false,
+        };
+      }
+      setPinStatuses(initialPins);
+      currentJobIdRef.current = jobId;
+    }
+
+    loadGateTime();
     loadJobStep();
     loadExistingServerData();
     loadStrings();
-  }, []);
+  }, [jobId]);
 
-  // Pulse animation for flagged strings
   useEffect(() => {
     Animated.loop(
       Animated.sequence([
@@ -167,24 +173,246 @@ export default function SLDMapScreen({ navigation, route }: any) {
     ).start();
   }, []);
 
+  // Track if we've already fired the events so we don't spam the server
+  const workStartedFired = useRef(false);
+  const workFinishedFired = useRef(false);
+
+  // 🚀 CRITICAL FIX: Automatically fire Start/Finish timestamps!
+  useEffect(() => {
+    if (!points || points.length === 0 || phase !== "at_panel") return;
+
+    // Count how many pins have a Before photo and After photo uploaded/saved
+    const beforeCount = Object.values(pinStatuses).filter(
+      (s) => s.beforeUploaded,
+    ).length;
+    const afterCount = Object.values(pinStatuses).filter(
+      (s) => s.afterUploaded,
+    ).length;
+
+    // 1. If they took their first BEFORE photo, fire WORK STARTED
+    if (beforeCount >= 1 && !workStartedFired.current) {
+      workStartedFired.current = true;
+      fireEvent("work_started");
+    }
+
+    // 2. If they finished their last AFTER photo, fire WORK FINISHED
+    if (
+      afterCount === points.length &&
+      points.length > 0 &&
+      !workFinishedFired.current
+    ) {
+      workFinishedFired.current = true;
+      fireEvent("work_finished");
+    }
+  }, [pinStatuses, phase, points.length]);
+
+  // ─── OFFLINE MANAGER ───
+  // ─── OFFLINE MANAGER ───
+  useFocusEffect(
+    React.useCallback(() => {
+      const checkData = async () => {
+        try {
+          // 1. Load the offline queue
+          const stored = await AsyncStorage.getItem(OFFLINE_QUEUE_KEY);
+          if (stored) setOfflineQueue(JSON.parse(stored));
+
+          // 2. 🚀 Instantly check if the FSR was completed locally
+          const fsrFlag = await AsyncStorage.getItem(`@fsr_done_${jobId}`);
+          if (fsrFlag === "true") setFsrDone(true);
+
+          // 3. Re-fetch server status just in case
+          loadJobStep();
+        } catch (e) {}
+      };
+      checkData();
+    }, [jobId]),
+  );
+
+  const saveToOfflineQueue = async (action: Omit<QueuedAction, "id">) => {
+    try {
+      const newAction = { ...action, id: Date.now().toString() };
+      const updatedQueue = [...offlineQueue, newAction];
+      setOfflineQueue(updatedQueue);
+      await AsyncStorage.setItem(
+        OFFLINE_QUEUE_KEY,
+        JSON.stringify(updatedQueue),
+      );
+    } catch (e) {
+      Toast.show({ type: "error", text1: "Failed to save offline." });
+    }
+  };
+
+  const processOfflineQueue = async () => {
+    const network = await Network.getNetworkStateAsync();
+    if (!network.isConnected) {
+      Toast.show({
+        type: "error",
+        text1: "Still Offline",
+        text2: "Connect to internet to sync.",
+      });
+      return;
+    }
+    if (offlineQueue.length === 0) return;
+
+    setIsSyncing(true);
+    const token = await SecureStore.getItemAsync("userToken");
+    let remainingQueue = [...offlineQueue];
+
+    for (const action of offlineQueue) {
+      try {
+        if (action.type === "EVENT") {
+          await fetch(`${SERVER_BASE}/api/mideast/jobs/${action.jobId}/event`, {
+            method: "PATCH",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(action.payload),
+          });
+        } else if (action.type === "PHOTO") {
+          const form = new FormData();
+          form.append("photo", {
+            uri: action.payload.uri,
+            type: "image/jpeg",
+            name: action.payload.name,
+          } as any);
+          form.append("point_id", action.payload.point_id);
+          form.append("photo_type", action.payload.photo_type);
+          form.append("taken_at", action.payload.taken_at);
+          await fetch(
+            `${SERVER_BASE}/api/mideast/point-photos/job/${action.jobId}`,
+            {
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}` },
+              body: form,
+            },
+          );
+        } else if (action.type === "ANNOTATION") {
+          await fetch(
+            `${SERVER_BASE}/api/mideast/fo-annotations/job/${action.jobId}`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(action.payload),
+            },
+          );
+        } else if (action.type === "TPT") {
+          // 🚀 Added TPT Offline handling
+          const form = new FormData();
+          form.append("photo", {
+            uri: action.payload.uri,
+            type: "image/jpeg",
+            name: "tpt.jpg",
+          } as any);
+          form.append("taken_at", action.payload.taken_at);
+          await fetch(
+            `${SERVER_BASE}/api/mideast/jobs/${action.jobId}/tpt-photo`,
+            {
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}` },
+              body: form,
+            },
+          );
+        } else if (action.type === "FSR") {
+          // 🚀 NEW: Added FSR Offline handling
+          await fetch(`${SERVER_BASE}/api/mideast/jobs/${action.jobId}/fsr`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(action.payload),
+          });
+        }
+
+        // Only removes the item from the queue if the fetch succeeds without throwing an error
+        remainingQueue = remainingQueue.filter((q) => q.id !== action.id);
+        setOfflineQueue(remainingQueue);
+        await AsyncStorage.setItem(
+          OFFLINE_QUEUE_KEY,
+          JSON.stringify(remainingQueue),
+        );
+      } catch (e) {
+        console.error("Sync failed for item:", action.id);
+      }
+    }
+
+    setIsSyncing(false);
+
+    if (remainingQueue.length === 0) {
+      Toast.show({
+        type: "success",
+        text1: "Sync Complete!",
+        text2: "All offline data uploaded.",
+      });
+    } else {
+      Toast.show({
+        type: "info",
+        text1: "Partial Sync",
+        text2: "Some items failed. Will retry later.",
+      });
+    }
+  };
+
+  // ─── CORE LOGIC ───
+  const loadGateTime = async () => {
+    try {
+      const stored = await SecureStore.getItemAsync(`gateTime_${jobId}`);
+      if (stored) {
+        const time = parseInt(stored, 10);
+        setGateTime(time);
+        const elapsed = Math.floor((Date.now() - time) / 1000);
+        setTimeRemaining(Math.max(0, REQUIRED_WAIT_SECONDS - elapsed));
+      }
+    } catch (e) {}
+  };
+
+  useEffect(() => {
+    if ((jobStep === 0 || phase === "at_gate") && gateTime) {
+      const interval = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - gateTime) / 1000);
+        const remaining = Math.max(0, REQUIRED_WAIT_SECONDS - elapsed);
+        setTimeRemaining(remaining);
+        if (remaining === 0) clearInterval(interval);
+      }, 1000);
+      return () => clearInterval(interval);
+    }
+  }, [jobStep, phase, gateTime]);
+
   const loadJobStep = async () => {
     try {
       const token = await SecureStore.getItemAsync("userToken");
       const res = await fetch(`${SERVER_BASE}/api/mideast/jobs/${jobId}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (!res.ok) throw new Error();
+      if (!res.ok) return;
       const data = await res.json();
       const status = data.job?.status ?? "scheduled";
-      setJobStep(STATUS_TO_STEP[status] ?? -1);
-      if (STATUS_TO_STEP[status] >= 2) workStartedFired.current = true;
-      if (STATUS_TO_STEP[status] >= 3) workFinishedFired.current = true;
-      if (data.job?.tpt_photo_url) setTptUploaded(true);
-    } catch {
-      Toast.show({ type: "error", text1: "Could not load job status." });
-    } finally {
-      setStepLoading(false);
-    }
+      const stepVal = STATUS_TO_STEP[status] ?? -1;
+      setJobStep(stepVal);
+
+      // 🚀 CRITICAL FIX: Check the offline queue FIRST!
+      const stored = await AsyncStorage.getItem(OFFLINE_QUEUE_KEY);
+      let isOfflineCompleted = false;
+      if (stored) {
+        const q = JSON.parse(stored);
+        isOfflineCompleted = q.some(
+          (item: any) => item.type === "FSR" && item.jobId === jobId,
+        );
+      }
+
+      // If FSR is in the queue, force it to 'completed' so the button stays locked!
+      if (isOfflineCompleted || stepVal >= 4) {
+        setPhase("completed");
+      } else if (stepVal >= 1) {
+        setPhase("at_panel");
+      } else if (stepVal === 0) {
+        setPhase("at_gate");
+      }
+    } catch {}
   };
 
   const loadExistingServerData = async () => {
@@ -198,42 +426,35 @@ export default function SLDMapScreen({ navigation, route }: any) {
           headers: { Authorization: `Bearer ${token}` },
         }),
       ]);
-      const photosData = photosRes.ok ? await photosRes.json() : {};
-      const annotationsData = annotationsRes.ok
-        ? await annotationsRes.json()
-        : {};
-      const photos = Array.isArray(photosData)
-        ? photosData
-        : (photosData.photos ?? []);
-      const annotations = Array.isArray(annotationsData)
-        ? annotationsData
-        : (annotationsData.annotations ?? []);
-      setPinStatuses((prev) => {
-        const next = { ...prev };
-        for (const p of photos) {
-          if (!next[p.point_id]) continue;
-          p.photo_type === "before"
-            ? (next[p.point_id] = { ...next[p.point_id], beforeUploaded: true })
-            : (next[p.point_id] = { ...next[p.point_id], afterUploaded: true });
-        }
-        for (const a of annotations) {
-          if (!next[a.point_id]) continue;
-          next[a.point_id] = { ...next[a.point_id], annotationSaved: true };
-        }
-        return next;
-      });
-    } catch {
-      /* best effort */
-    }
+      if (photosRes.ok && annotationsRes.ok) {
+        const photos = await photosRes.json();
+        const annotations = await annotationsRes.json();
+        const pArr = Array.isArray(photos) ? photos : (photos.photos ?? []);
+        const aArr = Array.isArray(annotations)
+          ? annotations
+          : (annotations.annotations ?? []);
+        setPinStatuses((prev) => {
+          const next = { ...prev };
+          for (const p of pArr) {
+            if (next[p.point_id])
+              next[p.point_id][
+                p.photo_type === "before" ? "beforeUploaded" : "afterUploaded"
+              ] = true;
+          }
+          for (const a of aArr) {
+            if (next[a.point_id]) next[a.point_id].annotationSaved = true;
+          }
+          return next;
+        });
+      }
+    } catch {}
   };
-
-  // ── Load string shapes + flags ────────────────────────────────────────────
 
   const loadStrings = async () => {
     if (!diagram?.id) return;
     try {
       const token = await SecureStore.getItemAsync("userToken");
-      const [stringsSettled, flagsSettled] = await Promise.allSettled([
+      const [stringsRes, flagsRes] = await Promise.all([
         fetch(`${SERVER_BASE}/api/mideast/strings/diagram/${diagram.id}`, {
           headers: { Authorization: `Bearer ${token}` },
         }),
@@ -241,142 +462,255 @@ export default function SLDMapScreen({ navigation, route }: any) {
           headers: { Authorization: `Bearer ${token}` },
         }),
       ]);
-      if (stringsSettled.status === "fulfilled" && stringsSettled.value.ok) {
-        const data = await stringsSettled.value.json();
-        setJobStrings(data.strings || []);
-      }
-      if (flagsSettled.status === "fulfilled" && flagsSettled.value.ok) {
-        const data = await flagsSettled.value.json();
-        setJobStringFlags((data.flags || []).map((f: any) => f.string_id));
-      }
-    } catch {
-      /* best effort */
-    }
+      if (stringsRes.ok) setJobStrings((await stringsRes.json()).strings || []);
+      if (flagsRes.ok)
+        setJobStringFlags(
+          ((await flagsRes.json()).flags || []).map((f: any) => f.string_id),
+        );
+    } catch {}
   };
-
-  // ─── Auto work_started / work_finished ───────────────────────────────────
-
-  useEffect(() => {
-    if (jobStep < 1) return;
-    const beforeCount = Object.values(pinStatuses).filter(
-      (s) => s.beforeUploaded,
-    ).length;
-    if (beforeCount >= 1 && !workStartedFired.current && jobStep === 1) {
-      workStartedFired.current = true;
-      fireEvent("work_started");
-    }
-    const afterCount = Object.values(pinStatuses).filter(
-      (s) => s.afterUploaded,
-    ).length;
-    if (
-      afterCount === points.length &&
-      points.length > 0 &&
-      !workFinishedFired.current &&
-      jobStep === 2
-    ) {
-      workFinishedFired.current = true;
-      fireEvent("work_finished");
-    }
-  }, [pinStatuses, jobStep]);
-
-  // ─── Fire event ───────────────────────────────────────────────────────────
 
   const fireEvent = async (eventKey: string) => {
     const performedAt = new Date().toISOString();
     setJobStep(EVENT_TO_STEP[eventKey]);
+    const payload = {
+      event: eventKey,
+      timestamp: performedAt,
+      lat: null,
+      lng: null,
+    };
+    const network = await Network.getNetworkStateAsync();
+
+    if (!network.isConnected) {
+      await saveToOfflineQueue({ type: "EVENT", jobId, payload });
+      return;
+    }
     const token = await SecureStore.getItemAsync("userToken");
     try {
-      const res = await fetch(
-        `${SERVER_BASE}/api/mideast/jobs/${jobId}/event`,
-        {
-          method: "PATCH",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            event: eventKey,
-            timestamp: performedAt,
-            lat: null,
-            lng: null,
-          }),
+      await fetch(`${SERVER_BASE}/api/mideast/jobs/${jobId}/event`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
         },
-      );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    } catch {
-      Toast.show({
-        type: "error",
-        text1: "Could not record event.",
-        text2: "Check connection and try again.",
+        body: JSON.stringify(payload),
       });
+    } catch {
+      await saveToOfflineQueue({ type: "EVENT", jobId, payload });
     }
   };
 
+  // ─── EXECUTION PROTOCOL HANDLERS ───
+  const handleReachGate = async () => {
+    setFiringEvent(true);
+    const now = Date.now();
+    setGateTime(now);
+    setTimeRemaining(REQUIRED_WAIT_SECONDS);
+    setPhase("at_gate");
+    SecureStore.setItemAsync(`gateTime_${jobId}`, now.toString()).catch(
+      () => {},
+    );
+    await fireEvent("reached_site");
+    Toast.show({
+      type: "success",
+      text1: "Gate Reached",
+      text2: "Wait for transit timer.",
+    });
+    setFiringEvent(false);
+  };
+
+  const handleReachPanel = async () => {
+    setFiringEvent(true);
+    setPhase("at_panel");
+    await fireEvent("reached_panels");
+    Toast.show({
+      type: "success",
+      text1: "Panel Reached",
+      text2: "FSR unlocked.",
+    });
+    setFiringEvent(false);
+  };
+
+  // ─── EVENT HANDLERS ───
   const handleManualEvent = async (eventKey: string) => {
+    setFiringEvent(true);
+
+    // 🚀 NEW: Explicit Leave Site action
     if (eventKey === "site_exited") {
-      navigation.navigate("FSRScreen", { jobId });
+      await fireEvent("site_exited");
+      setPhase("completed");
+      setFiringEvent(false);
+      Toast.show({
+        type: "success",
+        text1: "Job Completed!",
+        text2: "You have safely logged out of the site.",
+      });
+
+      // Go back to the dashboard after a short delay
+      setTimeout(() => {
+        navigation.navigate("JobOrders"); // Or navigation.goBack()
+      }, 1500);
       return;
     }
-    setFiringEvent(true);
+
+    if (eventKey === "reached_site") {
+      const now = Date.now();
+      setGateTime(now);
+      setTimeRemaining(REQUIRED_WAIT_SECONDS);
+      setPhase("at_gate");
+      SecureStore.setItemAsync(`gateTime_${jobId}`, now.toString()).catch(
+        () => {},
+      );
+    }
+    if (eventKey === "reached_panels") setPhase("at_panel");
+
     await fireEvent(eventKey);
     setFiringEvent(false);
   };
 
-  // ─── TPT Photo ────────────────────────────────────────────────────────────
+  // ─── CAMERA LOGIC ───
+  const launchPinCamera = async (target: "before" | "after") => {
+    if (!camPermission?.granted) {
+      const result = await requestCamPermission();
+      if (!result.granted) {
+        Alert.alert("Permission Required", "Camera access is needed.");
+        return;
+      }
+    }
+    setCameraTarget(target);
+    setShowCamera(true);
+  };
 
-  const takeTptPicture = async () => {
-    if (!tptCameraRef.current) return;
+  const takePicture = async () => {
+    if (!cameraRef.current || !selectedPin) return;
+    const performedAt = new Date().toISOString();
     try {
-      const photo = await tptCameraRef.current.takePictureAsync({
-        quality: 0.75,
-      });
-      setTptUri(photo.uri);
+      const photo = await cameraRef.current.takePictureAsync({ quality: 0.75 });
+      setShowCamera(false);
+
+      setPinStatuses((prev) => ({
+        ...prev,
+        [selectedPin.id]: {
+          ...prev[selectedPin.id],
+          ...(cameraTarget === "before"
+            ? { beforeUri: photo.uri, beforePerformedAt: performedAt }
+            : { afterUri: photo.uri, afterPerformedAt: performedAt }),
+        },
+      }));
     } catch {
       Toast.show({ type: "error", text1: "Camera Error" });
     }
   };
 
-  const uploadTptPhoto = async () => {
-    if (!tptUri) return;
-    setTptUploading(true);
+  const confirmPhoto = async (type: "before" | "after") => {
+    if (!selectedPin) return;
+    const status = pinStatuses[selectedPin.id];
+    const uri = type === "before" ? status?.beforeUri : status?.afterUri;
+    const performedAt =
+      type === "before" ? status?.beforePerformedAt : status?.afterPerformedAt;
+    if (!uri || !performedAt) return;
+
+    setSaving(true);
+    setPinStatuses((prev) => ({
+      ...prev,
+      [selectedPin.id]: {
+        ...prev[selectedPin.id],
+        ...(type === "before"
+          ? { beforeUploaded: true }
+          : { afterUploaded: true }),
+      },
+    }));
+
+    const payload = {
+      uri: uri,
+      point_id: String(selectedPin.id),
+      photo_type: type,
+      taken_at: performedAt, // <--- 8:30 AM is locked in here!
+      name: `${type}-${selectedPin.id}.jpg`,
+    };
+    const network = await Network.getNetworkStateAsync();
+
+    if (!network.isConnected) {
+      await saveToOfflineQueue({ type: "PHOTO", jobId, payload });
+      Toast.show({ type: "info", text1: "Saved Offline" });
+      setSaving(false);
+      if (type === "before") setActiveTab("ANNOTATE");
+      else closeModal();
+      return;
+    }
+
     const token = await SecureStore.getItemAsync("userToken");
     try {
       const form = new FormData();
       form.append("photo", {
-        uri: tptUri,
+        uri: payload.uri,
         type: "image/jpeg",
-        name: "tpt.jpg",
+        name: payload.name,
       } as any);
-      form.append("taken_at", new Date().toISOString());
-      const res = await fetch(
-        `${SERVER_BASE}/api/mideast/jobs/${jobId}/tpt-photo`,
-        {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}` },
-          body: form,
-        },
-      );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setTptUploaded(true);
-      setShowTptCamera(false);
-      setTptUri(null);
-      Toast.show({
-        type: "success",
-        text1: "TPT photo saved. Diagram unlocked.",
+      form.append("point_id", payload.point_id);
+      form.append("photo_type", payload.photo_type);
+      form.append("taken_at", payload.taken_at);
+      await fetch(`${SERVER_BASE}/api/mideast/point-photos/job/${jobId}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
       });
+      Toast.show({ type: "success", text1: "Photo uploaded." });
     } catch {
-      Toast.show({
-        type: "error",
-        text1: "Upload failed.",
-        text2: "Check connection and try again.",
-      });
+      await saveToOfflineQueue({ type: "PHOTO", jobId, payload });
+      Toast.show({ type: "info", text1: "Saved Offline" });
     } finally {
-      setTptUploading(false);
+      setSaving(false);
+      if (type === "before") setActiveTab("ANNOTATE");
+      else closeModal();
     }
   };
 
-  // ─── Coordinate helpers ───────────────────────────────────────────────────
+  const saveAnnotation = async () => {
+    if (!selectedPin) return;
+    const annotatedAt = new Date().toISOString();
+    setSaving(true);
 
+    setPinStatuses((prev) => ({
+      ...prev,
+      [selectedPin.id]: { ...prev[selectedPin.id], annotationSaved: true },
+    }));
+    const payload = {
+      point_id: selectedPin.id,
+      note: note.trim() || "No observation noted.",
+      flag: flagged,
+      annotated_at: annotatedAt,
+    };
+
+    const network = await Network.getNetworkStateAsync();
+    if (!network.isConnected) {
+      await saveToOfflineQueue({ type: "ANNOTATION", jobId, payload });
+      Toast.show({ type: "info", text1: "Saved Offline" });
+      setSaving(false);
+      setActiveTab("AFTER");
+      return;
+    }
+
+    const token = await SecureStore.getItemAsync("userToken");
+    try {
+      await fetch(`${SERVER_BASE}/api/mideast/fo-annotations/job/${jobId}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+      Toast.show({ type: "success", text1: "Annotation saved." });
+    } catch {
+      await saveToOfflineQueue({ type: "ANNOTATION", jobId, payload });
+    } finally {
+      setSaving(false);
+      setActiveTab("AFTER");
+    }
+  };
+
+  // ─── UI Rendering Helpers ───
   const getRenderedImageRect = useCallback(() => {
     const cA = containerLayout.width / containerLayout.height;
     const iA = imageNatural.width / imageNatural.height;
@@ -403,7 +737,6 @@ export default function SLDMapScreen({ navigation, route }: any) {
     };
   };
 
-  // Convert polygon percentage points to absolute pixel coordinates (for SVG)
   const toSvgPoints = (polygonPoints: Array<{ x: number; y: number }>) => {
     const { rW, rH, oX, oY } = getRenderedImageRect();
     return polygonPoints
@@ -411,7 +744,6 @@ export default function SLDMapScreen({ navigation, route }: any) {
       .join(" ");
   };
 
-  // Centroid of polygon (for label placement)
   const getCentroid = (polygonPoints: Array<{ x: number; y: number }>) => {
     const { rW, rH, oX, oY } = getRenderedImageRect();
     const cx =
@@ -429,8 +761,6 @@ export default function SLDMapScreen({ navigation, route }: any) {
     return { cx, cy };
   };
 
-  // ─── Pin helpers ──────────────────────────────────────────────────────────
-
   const getPinState = (id: number): "empty" | "before" | "done" => {
     const s = pinStatuses[id];
     if (!s) return "empty";
@@ -445,9 +775,7 @@ export default function SLDMapScreen({ navigation, route }: any) {
   };
 
   const doneCount = points.filter((p) => pinDone(p.id)).length;
-  const pinsLocked = jobStep < 1 || (jobStep === 1 && !tptUploaded);
-
-  // ─── Modal ────────────────────────────────────────────────────────────────
+  const pinsLocked = phase === "overview" || phase === "at_gate";
 
   const openPin = (point: Point) => {
     if (pinsLocked) return;
@@ -462,354 +790,11 @@ export default function SLDMapScreen({ navigation, route }: any) {
     setShowCamera(false);
   };
 
-  // ─── Camera ───────────────────────────────────────────────────────────────
-
-  const launchCamera = async (target: "before" | "after") => {
-    if (!camPermission?.granted) {
-      const result = await requestCamPermission();
-      if (!result.granted) {
-        Alert.alert("Permission Required", "Camera access is needed.");
-        return;
-      }
-    }
-    setCameraTarget(target);
-    setShowCamera(true);
+  const formatTime = (secs: number) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   };
-
-  const takePicture = async () => {
-    if (!cameraRef.current || !selectedPin) return;
-    const performedAt = new Date().toISOString();
-    try {
-      const photo = await cameraRef.current.takePictureAsync({ quality: 0.75 });
-      setShowCamera(false);
-      setPinStatuses((prev) => ({
-        ...prev,
-        [selectedPin.id]: {
-          ...prev[selectedPin.id],
-          ...(cameraTarget === "before"
-            ? { beforeUri: photo.uri, beforePerformedAt: performedAt }
-            : { afterUri: photo.uri, afterPerformedAt: performedAt }),
-        },
-      }));
-    } catch {
-      Toast.show({ type: "error", text1: "Camera Error" });
-    }
-  };
-
-  // ─── Confirm photo ────────────────────────────────────────────────────────
-
-  const confirmPhoto = async (type: "before" | "after") => {
-    if (!selectedPin) return;
-    const status = pinStatuses[selectedPin.id];
-    const uri = type === "before" ? status?.beforeUri : status?.afterUri;
-    const performedAt =
-      type === "before" ? status?.beforePerformedAt : status?.afterPerformedAt;
-    if (!uri || !performedAt) return;
-    setSaving(true);
-    const token = await SecureStore.getItemAsync("userToken");
-    try {
-      const form = new FormData();
-      form.append("photo", {
-        uri,
-        type: "image/jpeg",
-        name: `${type}-${selectedPin.id}.jpg`,
-      } as any);
-      form.append("point_id", String(selectedPin.id));
-      form.append("photo_type", type);
-      form.append("taken_at", performedAt);
-      const res = await fetch(
-        `${SERVER_BASE}/api/mideast/point-photos/job/${jobId}`,
-        {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}` },
-          body: form,
-        },
-      );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setPinStatuses((prev) => ({
-        ...prev,
-        [selectedPin.id]: {
-          ...prev[selectedPin.id],
-          ...(type === "before"
-            ? { beforeUploaded: true }
-            : { afterUploaded: true }),
-        },
-      }));
-      Toast.show({
-        type: "success",
-        text1: `${type === "before" ? "Before" : "After"} photo uploaded.`,
-      });
-      if (type === "before") setActiveTab("ANNOTATE");
-      else closeModal();
-    } catch {
-      Toast.show({
-        type: "error",
-        text1: "Upload failed.",
-        text2: "Check connection and try again.",
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  // ─── Save annotation ──────────────────────────────────────────────────────
-
-  const saveAnnotation = async () => {
-    if (!selectedPin) return;
-    const annotatedAt = new Date().toISOString();
-    setSaving(true);
-    const token = await SecureStore.getItemAsync("userToken");
-    try {
-      const res = await fetch(
-        `${SERVER_BASE}/api/mideast/fo-annotations/job/${jobId}`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            point_id: selectedPin.id,
-            note: note.trim() || "No observation noted.",
-            flag: flagged,
-            annotated_at: annotatedAt,
-          }),
-        },
-      );
-      if (!res.ok) throw new Error();
-      setPinStatuses((prev) => ({
-        ...prev,
-        [selectedPin.id]: { ...prev[selectedPin.id], annotationSaved: true },
-      }));
-      Toast.show({ type: "success", text1: "Annotation saved." });
-      setActiveTab("AFTER");
-    } catch {
-      Toast.show({
-        type: "error",
-        text1: "Save failed.",
-        text2: "Check connection and try again.",
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  // ─── Stepper ──────────────────────────────────────────────────────────────
-
-  const renderStepper = () => (
-    <View style={styles.stepper}>
-      {STEP_DEFS.map((step, index) => {
-        const done = jobStep >= index;
-        const current = jobStep === index - 1;
-        return (
-          <React.Fragment key={step.key}>
-            {index > 0 && (
-              <View style={[styles.stepLine, done && styles.stepLineDone]} />
-            )}
-            <View style={styles.stepItem}>
-              <View
-                style={[
-                  styles.stepCircle,
-                  done && styles.stepCircleDone,
-                  current && styles.stepCircleCurrent,
-                ]}
-              >
-                {done ? (
-                  <Ionicons name="checkmark" size={13} color="#080C18" />
-                ) : (
-                  <Ionicons
-                    name={step.icon as any}
-                    size={13}
-                    color={current ? "#080C18" : "#475569"}
-                  />
-                )}
-              </View>
-              <Text
-                style={[
-                  styles.stepLabel,
-                  done && styles.stepLabelDone,
-                  current && styles.stepLabelCurrent,
-                ]}
-              >
-                {step.label}
-              </Text>
-            </View>
-          </React.Fragment>
-        );
-      })}
-    </View>
-  );
-
-  // ─── CTA Card ─────────────────────────────────────────────────────────────
-
-  const renderCTACard = () => {
-    if (stepLoading) return null;
-    const nextStep = jobStep + 1;
-
-    if (nextStep === 0)
-      return (
-        <View style={styles.ctaCard}>
-          <View style={styles.ctaCardLeft}>
-            <View
-              style={[
-                styles.ctaIcon,
-                { backgroundColor: "rgba(14,165,233,0.15)" },
-              ]}
-            >
-              <Ionicons name="location" size={22} color="#0EA5E9" />
-            </View>
-            <View>
-              <Text style={styles.ctaTitle}>Arrived at site?</Text>
-              <Text style={styles.ctaSubtitle}>Tap to log your arrival</Text>
-            </View>
-          </View>
-          <TouchableOpacity
-            style={[styles.ctaBtn, firingEvent && styles.ctaBtnDisabled]}
-            onPress={() => handleManualEvent("reached_site")}
-            disabled={firingEvent}
-          >
-            {firingEvent ? (
-              <ActivityIndicator size="small" color="#080C18" />
-            ) : (
-              <Text style={styles.ctaBtnText}>REACHED SITE</Text>
-            )}
-          </TouchableOpacity>
-        </View>
-      );
-
-    if (nextStep === 1)
-      return (
-        <View style={styles.ctaCard}>
-          <View style={styles.ctaCardLeft}>
-            <View
-              style={[
-                styles.ctaIcon,
-                { backgroundColor: "rgba(14,165,233,0.15)" },
-              ]}
-            >
-              <Ionicons name="grid" size={22} color="#0EA5E9" />
-            </View>
-            <View>
-              <Text style={styles.ctaTitle}>At the panels?</Text>
-              <Text style={styles.ctaSubtitle}>Tap to proceed</Text>
-            </View>
-          </View>
-          <TouchableOpacity
-            style={[styles.ctaBtn, firingEvent && styles.ctaBtnDisabled]}
-            onPress={() => handleManualEvent("reached_panels")}
-            disabled={firingEvent}
-          >
-            {firingEvent ? (
-              <ActivityIndicator size="small" color="#080C18" />
-            ) : (
-              <Text style={styles.ctaBtnText}>REACHED PANELS</Text>
-            )}
-          </TouchableOpacity>
-        </View>
-      );
-
-    if (nextStep === 2) {
-      if (!tptUploaded)
-        return (
-          <View
-            style={[
-              styles.ctaCard,
-              {
-                borderColor: "rgba(245,158,11,0.35)",
-                backgroundColor: "rgba(245,158,11,0.05)",
-              },
-            ]}
-          >
-            <View style={styles.ctaCardLeft}>
-              <View
-                style={[
-                  styles.ctaIcon,
-                  { backgroundColor: "rgba(245,158,11,0.15)" },
-                ]}
-              >
-                <Ionicons name="camera" size={22} color="#F59E0B" />
-              </View>
-              <View>
-                <Text style={styles.ctaTitle}>Toolbox Talk Photo</Text>
-                <Text style={styles.ctaSubtitle}>
-                  Required before starting work
-                </Text>
-              </View>
-            </View>
-            <TouchableOpacity
-              style={[styles.ctaBtn, { backgroundColor: "#F59E0B" }]}
-              onPress={() => setShowTptCamera(true)}
-            >
-              <Text style={styles.ctaBtnText}>TAKE PHOTO</Text>
-            </TouchableOpacity>
-          </View>
-        );
-      return (
-        <View style={[styles.ctaCard, styles.ctaCardInfo]}>
-          <Ionicons name="camera-outline" size={20} color="#22D3A5" />
-          <Text style={styles.ctaInfoText}>
-            Take a BEFORE photo on each pin to begin work
-          </Text>
-        </View>
-      );
-    }
-
-    if (nextStep === 3)
-      return (
-        <View style={[styles.ctaCard, styles.ctaCardInfo]}>
-          <Ionicons name="sync-outline" size={20} color="#F59E0B" />
-          <Text style={styles.ctaInfoText}>
-            {doneCount}/{points.length} pins done — complete all AFTER photos to
-            finish
-          </Text>
-        </View>
-      );
-
-    if (nextStep === 4)
-      return (
-        <View
-          style={[
-            styles.ctaCard,
-            {
-              borderColor: "rgba(34,211,165,0.4)",
-              backgroundColor: "rgba(34,211,165,0.05)",
-            },
-          ]}
-        >
-          <View style={styles.ctaCardLeft}>
-            <View
-              style={[
-                styles.ctaIcon,
-                { backgroundColor: "rgba(34,211,165,0.15)" },
-              ]}
-            >
-              <Ionicons name="exit" size={22} color="#22D3A5" />
-            </View>
-            <View>
-              <Text style={styles.ctaTitle}>All done!</Text>
-              <Text style={styles.ctaSubtitle}>
-                Fill in your service report
-              </Text>
-            </View>
-          </View>
-          <TouchableOpacity
-            style={[
-              styles.ctaBtn,
-              { backgroundColor: "#22D3A5" },
-              firingEvent && styles.ctaBtnDisabled,
-            ]}
-            onPress={() => handleManualEvent("site_exited")}
-            disabled={firingEvent}
-          >
-            <Text style={styles.ctaBtnText}>SUBMIT FSR</Text>
-          </TouchableOpacity>
-        </View>
-      );
-
-    return null;
-  };
-
-  // ─── Photo tab ────────────────────────────────────────────────────────────
 
   const renderPhotoTab = (type: "before" | "after") => {
     if (!selectedPin) return null;
@@ -829,29 +814,6 @@ export default function SLDMapScreen({ navigation, route }: any) {
         </View>
       );
 
-    if (showCamera && cameraTarget === type)
-      return (
-        <View style={styles.cameraContainer}>
-          <CameraView
-            ref={cameraRef}
-            style={StyleSheet.absoluteFill}
-            facing="back"
-          />
-          <View style={styles.cameraControls}>
-            <TouchableOpacity
-              onPress={() => setShowCamera(false)}
-              style={styles.camBtn}
-            >
-              <Ionicons name="close" size={28} color="#fff" />
-            </TouchableOpacity>
-            <TouchableOpacity onPress={takePicture} style={styles.captureBtn}>
-              <View style={styles.captureInner} />
-            </TouchableOpacity>
-            <View style={{ width: 52 }} />
-          </View>
-        </View>
-      );
-
     if (uri)
       return (
         <View style={styles.tabContent}>
@@ -864,14 +826,14 @@ export default function SLDMapScreen({ navigation, route }: any) {
             <View style={styles.statusBadge}>
               <Ionicons name="checkmark-circle" size={16} color="#22D3A5" />
               <Text style={[styles.statusBadgeText, { color: "#22D3A5" }]}>
-                Uploaded
+                Saved
               </Text>
             </View>
           ) : (
             <View style={styles.photoActions}>
               <TouchableOpacity
                 style={styles.retakeBtn}
-                onPress={() => launchCamera(type)}
+                onPress={() => launchPinCamera(type)}
               >
                 <Ionicons name="camera" size={16} color="#94A3B8" />
                 <Text style={styles.retakeBtnText}>Retake</Text>
@@ -904,12 +866,12 @@ export default function SLDMapScreen({ navigation, route }: any) {
         />
         <Text style={styles.photoPrompt}>
           {type === "before"
-            ? "Capture panel condition BEFORE cleaning."
-            : "Capture panel condition AFTER cleaning."}
+            ? "Capture panel BEFORE cleaning."
+            : "Capture panel AFTER cleaning."}
         </Text>
         <TouchableOpacity
           style={styles.takePhotoBtn}
-          onPress={() => launchCamera(type)}
+          onPress={() => launchPinCamera(type)}
         >
           <Ionicons name="camera" size={20} color="#080C18" />
           <Text style={styles.takePhotoBtnText}>Open Camera</Text>
@@ -917,8 +879,6 @@ export default function SLDMapScreen({ navigation, route }: any) {
       </View>
     );
   };
-
-  // ─── Annotate tab ─────────────────────────────────────────────────────────
 
   const renderAnnotateTab = () => {
     if (!selectedPin) return null;
@@ -979,30 +939,6 @@ export default function SLDMapScreen({ navigation, route }: any) {
     );
   };
 
-  // ─── No diagram fallback ──────────────────────────────────────────────────
-
-  if (!diagram)
-    return (
-      <LinearGradient colors={["#080C18", "#0D1120"]} style={styles.container}>
-        <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}>
-          <View style={styles.centered}>
-            <Ionicons name="map-outline" size={64} color="#1E2A45" />
-            <Text style={styles.noDiagramText}>
-              No diagram assigned to this job.
-            </Text>
-            <TouchableOpacity
-              onPress={() => navigation.goBack()}
-              style={styles.goBackBtn}
-            >
-              <Text style={styles.goBackBtnText}>Go Back</Text>
-            </TouchableOpacity>
-          </View>
-        </SafeAreaView>
-      </LinearGradient>
-    );
-
-  // ─── Main render ──────────────────────────────────────────────────────────
-
   const flaggedCount = jobStringFlags.length;
   const pulseOpacity = pulseAnim.interpolate({
     inputRange: [0, 1],
@@ -1013,6 +949,7 @@ export default function SLDMapScreen({ navigation, route }: any) {
     <LinearGradient colors={["#080C18", "#0D1120"]} style={styles.container}>
       <StatusBar barStyle="light-content" />
       <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}>
+        {/* HEADER */}
         <View style={styles.header}>
           <TouchableOpacity
             onPress={() => navigation.goBack()}
@@ -1022,248 +959,502 @@ export default function SLDMapScreen({ navigation, route }: any) {
           </TouchableOpacity>
           <View style={styles.headerCenter}>
             <Text style={styles.headerTitle}>
-              {diagram.title ?? "SITE MAP"}
+              {diagram?.title ?? "SITE MAP"}
             </Text>
             <Text style={styles.headerSub}>
               {doneCount}/{points.length} PINS DONE
             </Text>
           </View>
-          <View style={{ width: 40 }} />
+          {offlineQueue.length > 0 ? (
+            <TouchableOpacity
+              onPress={processOfflineQueue}
+              style={styles.syncBtn}
+            >
+              {isSyncing ? (
+                <ActivityIndicator color="#F59E0B" size="small" />
+              ) : (
+                <>
+                  <Ionicons name="cloud-upload" size={18} color="#F59E0B" />
+                  <Text style={styles.syncBtnText}>{offlineQueue.length}</Text>
+                </>
+              )}
+            </TouchableOpacity>
+          ) : (
+            <View style={{ width: 40 }} />
+          )}
         </View>
 
-        {renderStepper()}
-        {renderCTACard()}
-
-        {/* ── Flagged strings warning banner ── */}
-        {flaggedCount > 0 && (
-          <Animated.View style={[styles.flagBanner, { opacity: pulseOpacity }]}>
-            <Ionicons name="warning" size={15} color="#FCA5A5" />
-            <Text style={styles.flagBannerText}>
-              {flaggedCount} string{flaggedCount > 1 ? "s" : ""} require
-              attention on this job
+        {offlineQueue.length > 0 && !isSyncing && (
+          <View style={styles.offlineBanner}>
+            <Ionicons name="cloud-offline" size={14} color="#94A3B8" />
+            <Text style={styles.offlineBannerText}>
+              Working Offline — {offlineQueue.length} items waiting to sync.
             </Text>
-          </Animated.View>
-        )}
-
-        {jobStep >= 1 && (
-          <View style={styles.progressTrack}>
-            <View
-              style={[
-                styles.progressFill,
-                {
-                  width:
-                    points.length > 0
-                      ? `${(doneCount / points.length) * 100}%`
-                      : "0%",
-                },
-              ]}
-            />
           </View>
         )}
 
-        {/* ── Diagram container ── */}
-        <View
-          style={styles.diagramContainer}
-          onLayout={(e) =>
-            setContainerLayout({
-              width: e.nativeEvent.layout.width,
-              height: e.nativeEvent.layout.height,
-            })
-          }
+        <ScrollView
+          contentContainerStyle={{ flexGrow: 1, paddingBottom: 40 }}
+          showsVerticalScrollIndicator={false}
         >
-          {imageUrl && (
-            <>
-              <Image
-                source={{ uri: imageUrl }}
-                style={StyleSheet.absoluteFill}
-                resizeMode="contain"
-                onLoad={(e) => {
-                  setImageNatural({
-                    width: e.nativeEvent.source.width,
-                    height: e.nativeEvent.source.height,
-                  });
-                  setImageLoading(false);
-                }}
-              />
-              {imageLoading && (
-                <View style={styles.imageLoader}>
-                  <ActivityIndicator size="large" color="#0EA5E9" />
-                  <Text style={styles.imageLoaderText}>LOADING DIAGRAM...</Text>
-                </View>
-              )}
-            </>
-          )}
+          {/* ── DIAGRAM AREA ── */}
+          <View
+            style={styles.diagramContainer}
+            onLayout={(e) =>
+              setContainerLayout({
+                width: e.nativeEvent.layout.width,
+                height: e.nativeEvent.layout.height,
+              })
+            }
+          >
+            {imageUrl && (
+              <>
+                <Image
+                  source={{ uri: imageUrl }}
+                  style={StyleSheet.absoluteFill}
+                  resizeMode="contain"
+                  onLoad={(e) => {
+                    setImageNatural({
+                      width: e.nativeEvent.source.width,
+                      height: e.nativeEvent.source.height,
+                    });
+                    setImageLoading(false);
+                  }}
+                />
+                {imageLoading && (
+                  <View style={styles.imageLoader}>
+                    <ActivityIndicator size="large" color="#0EA5E9" />
+                    <Text style={styles.imageLoaderText}>
+                      LOADING DIAGRAM...
+                    </Text>
+                  </View>
+                )}
+              </>
+            )}
 
-          {/* ── String polygon overlays ── */}
-          {!imageLoading && jobStrings.length > 0 && (
-            <Svg style={StyleSheet.absoluteFill} pointerEvents="none">
-              {jobStrings.map((s) => {
-                const pts = Array.isArray(s.points) ? s.points : [];
-                if (pts.length < 3) return null;
-                const isFlagged = jobStringFlags.includes(s.id);
+            {!imageLoading && jobStrings.length > 0 && (
+              <Svg style={StyleSheet.absoluteFill} pointerEvents="none">
+                {jobStrings.map((s) => {
+                  const pts = Array.isArray(s.points) ? s.points : [];
+                  if (pts.length < 3) return null;
+                  const isFlagged = jobStringFlags.includes(s.id);
+                  return (
+                    <SvgPolygon
+                      key={s.id}
+                      points={toSvgPoints(pts)}
+                      fill={isFlagged ? `${s.color}55` : `${s.color}20`}
+                      stroke={s.color}
+                      strokeWidth={isFlagged ? 2.5 : 1.5}
+                      strokeOpacity={isFlagged ? 1 : 0.55}
+                    />
+                  );
+                })}
+              </Svg>
+            )}
+
+            {!imageLoading &&
+              points.map((point, idx) => {
+                const state = getPinState(point.id);
+                const pinBg = pinsLocked
+                  ? "#1E2A45"
+                  : state === "done"
+                    ? "#22D3A5"
+                    : state === "before"
+                      ? "#F59E0B"
+                      : "#0EA5E9";
                 return (
-                  <SvgPolygon
-                    key={s.id}
-                    points={toSvgPoints(pts)}
-                    fill={isFlagged ? `${s.color}55` : `${s.color}20`}
-                    stroke={s.color}
-                    strokeWidth={isFlagged ? 2.5 : 1.5}
-                    strokeOpacity={isFlagged ? 1 : 0.55}
-                  />
+                  <TouchableOpacity
+                    key={point.id}
+                    style={[styles.pinWrapper, getPinStyle(point)]}
+                    onPress={() => openPin(point)}
+                    activeOpacity={pinsLocked ? 1 : 0.8}
+                  >
+                    <View
+                      style={[
+                        styles.pinDot,
+                        {
+                          backgroundColor: pinBg,
+                          borderColor: pinsLocked ? "#2D3A50" : "#fff",
+                        },
+                      ]}
+                    >
+                      {state === "done" && !pinsLocked ? (
+                        <Ionicons name="checkmark" size={16} color="#080C18" />
+                      ) : state === "before" && !pinsLocked ? (
+                        <Ionicons
+                          name="time-outline"
+                          size={14}
+                          color="#080C18"
+                        />
+                      ) : (
+                        <Text
+                          style={[
+                            styles.pinIndex,
+                            { color: pinsLocked ? "#2D3A50" : "#080C18" },
+                          ]}
+                        >
+                          {idx + 1}
+                        </Text>
+                      )}
+                    </View>
+                    {point.label ? (
+                      <View style={styles.pinLabelWrap}>
+                        <Text style={styles.pinLabelText} numberOfLines={1}>
+                          {point.label}
+                        </Text>
+                      </View>
+                    ) : null}
+                  </TouchableOpacity>
                 );
               })}
-            </Svg>
-          )}
 
-          {/* ── String centroid labels + flagged badges ── */}
-          {!imageLoading &&
-            jobStrings.map((s) => {
-              const pts = Array.isArray(s.points) ? s.points : [];
-              if (pts.length < 3) return null;
-              const isFlagged = jobStringFlags.includes(s.id);
-              const { cx, cy } = getCentroid(pts);
-              return isFlagged ? (
-                <Animated.View
-                  key={`lbl-${s.id}`}
-                  pointerEvents="none"
-                  style={[
-                    styles.stringLabelFlagged,
-                    {
-                      left: cx,
-                      top: cy,
-                      borderColor: s.color,
-                      backgroundColor: `${s.color}22`,
-                      opacity: pulseOpacity,
-                    },
-                  ]}
-                >
-                  <Text
-                    style={[styles.stringLabelFlaggedText, { color: s.color }]}
-                  >
-                    ⚠ {s.label}
-                  </Text>
-                </Animated.View>
-              ) : (
-                <View
-                  key={`lbl-${s.id}`}
-                  pointerEvents="none"
-                  style={[styles.stringLabel, { left: cx, top: cy }]}
-                >
-                  <Text style={[styles.stringLabelText, { color: s.color }]}>
-                    {s.label}
+            {/* 🚀 LOCK OVERLAY */}
+            {pinsLocked && !imageLoading && (
+              <View style={styles.diagramLockOverlay}>
+                <View style={styles.diagramLockCard}>
+                  <Ionicons name="lock-closed" size={28} color="#475569" />
+                  <Text style={styles.diagramLockText}>
+                    {phase === "overview"
+                      ? "Mark REACH GATE to begin"
+                      : "Wait for transit timer to unlock panels"}
                   </Text>
                 </View>
-              );
-            })}
-
-          {/* ── Pins ── */}
-          {!imageLoading &&
-            points.map((point, idx) => {
-              const state = getPinState(point.id);
-              const locked = pinsLocked;
-              const pinBg = locked
-                ? "#1E2A45"
-                : state === "done"
-                  ? "#22D3A5"
-                  : state === "before"
-                    ? "#F59E0B"
-                    : "#0EA5E9";
-              const shadowC = locked
-                ? "#000"
-                : state === "done"
-                  ? "#22D3A5"
-                  : state === "before"
-                    ? "#F59E0B"
-                    : "#0EA5E9";
-              return (
-                <TouchableOpacity
-                  key={point.id}
-                  style={[styles.pinWrapper, getPinStyle(point)]}
-                  onPress={() => openPin(point)}
-                  activeOpacity={locked ? 1 : 0.8}
-                >
-                  <View
-                    style={[
-                      styles.pinDot,
-                      {
-                        backgroundColor: pinBg,
-                        borderColor: locked ? "#2D3A50" : "#fff",
-                        shadowColor: shadowC,
-                        elevation: locked ? 0 : 6,
-                      },
-                    ]}
-                  >
-                    {state === "done" && !locked ? (
-                      <Ionicons name="checkmark" size={16} color="#080C18" />
-                    ) : state === "before" && !locked ? (
-                      <Ionicons name="time-outline" size={14} color="#080C18" />
-                    ) : (
-                      <Text
-                        style={[
-                          styles.pinIndex,
-                          { color: locked ? "#2D3A50" : "#080C18" },
-                        ]}
-                      >
-                        {idx + 1}
-                      </Text>
-                    )}
-                  </View>
-                  {point.label ? (
-                    <View style={styles.pinLabelWrap}>
-                      <Text style={styles.pinLabelText} numberOfLines={1}>
-                        {point.label}
-                      </Text>
-                    </View>
-                  ) : null}
-                </TouchableOpacity>
-              );
-            })}
-
-          {pinsLocked && !imageLoading && (
-            <View style={styles.diagramLockOverlay}>
-              <View style={styles.diagramLockCard}>
-                <Ionicons name="lock-closed" size={28} color="#475569" />
-                <Text style={styles.diagramLockText}>
-                  {jobStep < 1
-                    ? "Tap REACHED PANELS\nto unlock the diagram"
-                    : "Take TPT photo\nto unlock the diagram"}
-                </Text>
-              </View>
-            </View>
-          )}
-        </View>
-
-        {jobStep >= 1 && !pinsLocked && (
-          <View style={styles.legend}>
-            <View style={styles.legendItem}>
-              <View
-                style={[styles.legendDot, { backgroundColor: "#0EA5E9" }]}
-              />
-              <Text style={styles.legendText}>Pending</Text>
-            </View>
-            <View style={styles.legendItem}>
-              <View
-                style={[styles.legendDot, { backgroundColor: "#F59E0B" }]}
-              />
-              <Text style={styles.legendText}>Before done</Text>
-            </View>
-            <View style={styles.legendItem}>
-              <View
-                style={[styles.legendDot, { backgroundColor: "#22D3A5" }]}
-              />
-              <Text style={styles.legendText}>Complete</Text>
-            </View>
-            {flaggedCount > 0 && (
-              <View style={styles.legendItem}>
-                <Ionicons name="warning" size={10} color="#FCA5A5" />
-                <Text style={[styles.legendText, { color: "#FCA5A5" }]}>
-                  {flaggedCount} flagged
-                </Text>
               </View>
             )}
           </View>
-        )}
+
+          {/* ── EXECUTION PROTOCOL (The 3 Cards) ── */}
+          <View style={styles.workflowContainer}>
+            <Text style={styles.workflowTitle}>EXECUTION PROTOCOL</Text>
+
+            {/* 1. REACH GATE */}
+            <BlurView
+              intensity={20}
+              tint="dark"
+              style={[
+                styles.workflowCard,
+                phase !== "overview" && styles.cardCompleted,
+              ]}
+            >
+              <View style={styles.cardHeader}>
+                <Ionicons
+                  name="business"
+                  size={20}
+                  color={phase !== "overview" ? "#10B981" : "#0EA5E9"}
+                />
+                <Text style={styles.cardTitle}>1. REACH SITE GATE</Text>
+              </View>
+              <Text style={styles.cardDescription}>
+                Acknowledge arrival at the outer facility perimeter.
+              </Text>
+
+              {phase === "overview" ? (
+                <TouchableOpacity
+                  style={styles.actionBtn}
+                  onPress={handleReachGate}
+                >
+                  <Text style={styles.actionBtnText}>MARK REACH GATE</Text>
+                </TouchableOpacity>
+              ) : (
+                <View style={styles.completedBadge}>
+                  <Ionicons
+                    name="checkmark-circle"
+                    size={16}
+                    color="#10B981"
+                    style={{ marginRight: 6 }}
+                  />
+                  <Text style={styles.completedText}>GATE REACHED</Text>
+                </View>
+              )}
+            </BlurView>
+
+            {/* 2. REACH PANEL */}
+            <BlurView
+              intensity={20}
+              tint="dark"
+              style={[
+                styles.workflowCard,
+                phase === "overview" && styles.cardDisabled,
+                (phase === "at_panel" || phase === "completed") &&
+                  styles.cardCompleted,
+              ]}
+            >
+              <View style={styles.cardHeader}>
+                <Ionicons
+                  name="hardware-chip"
+                  size={20}
+                  color={
+                    phase === "at_panel" || phase === "completed"
+                      ? "#10B981"
+                      : phase === "at_gate"
+                        ? "#0EA5E9"
+                        : "#64748B"
+                  }
+                />
+                <Text style={styles.cardTitle}>2. REACH PANEL</Text>
+              </View>
+              {phase === "overview" && (
+                <Text style={styles.cardDescription}>
+                  Complete previous step to unlock.
+                </Text>
+              )}
+
+              {phase === "at_gate" && (
+                <View style={styles.timerContainer}>
+                  <Text style={styles.timerLabel}>MANDATORY WAIT</Text>
+                  <Text
+                    style={[
+                      styles.timerValue,
+                      timeRemaining === 0 && { color: "#10B981" },
+                    ]}
+                  >
+                    {formatTime(timeRemaining)}
+                  </Text>
+                  <TouchableOpacity
+                    style={[
+                      styles.actionBtn,
+                      timeRemaining > 0
+                        ? styles.actionBtnLocked
+                        : styles.actionBtnReady,
+                    ]}
+                    onPress={handleReachPanel}
+                    disabled={timeRemaining > 0}
+                  >
+                    <Text
+                      style={[
+                        styles.actionBtnText,
+                        timeRemaining === 0 && { color: "#080C18" },
+                      ]}
+                    >
+                      {timeRemaining > 0 ? "LOCKED" : "MARK REACH PANEL"}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+
+              {(phase === "at_panel" || phase === "completed") && (
+                <View style={styles.completedBadge}>
+                  <Ionicons
+                    name="checkmark-circle"
+                    size={16}
+                    color="#10B981"
+                    style={{ marginRight: 6 }}
+                  />
+                  <Text style={styles.completedText}>PANEL REACHED</Text>
+                </View>
+              )}
+            </BlurView>
+
+            {/* 3. FSR FORM REDIRECT */}
+            {/* 3. EXECUTION & FSR */}
+            <BlurView
+              intensity={20}
+              tint="dark"
+              style={[
+                styles.workflowCard,
+                phase !== "at_panel" &&
+                  phase !== "completed" &&
+                  styles.cardDisabled,
+                (fsrDone || phase === "completed") && styles.cardCompleted,
+              ]}
+            >
+              <View style={styles.cardHeader}>
+                <Ionicons
+                  name="document-text"
+                  size={20}
+                  color={
+                    fsrDone || phase === "completed"
+                      ? "#10B981"
+                      : phase === "at_panel"
+                        ? "#0EA5E9"
+                        : "#64748B"
+                  }
+                />
+                <Text style={styles.cardTitle}>3. EXECUTION & FSR</Text>
+              </View>
+              <Text style={styles.cardDescription}>
+                Complete all diagram pins, then fill out the final Field Service
+                Report.
+              </Text>
+
+              {phase === "at_panel" && !fsrDone && (
+                <View style={styles.fsrContainer}>
+                  {doneCount === points.length && points.length > 0 ? (
+                    // 🚀 Opens the FSR Screen Directly
+                    <TouchableOpacity
+                      style={[
+                        styles.actionBtn,
+                        { backgroundColor: "#10B981", borderColor: "#10B981" },
+                      ]}
+                      onPress={() =>
+                        navigation.navigate("FSRScreen", { jobId })
+                      }
+                    >
+                      <Ionicons
+                        name="document-text-outline"
+                        size={20}
+                        color="#080C18"
+                        style={{ marginRight: 8 }}
+                      />
+                      <Text
+                        style={[styles.actionBtnText, { color: "#080C18" }]}
+                      >
+                        FILL FSR FORM
+                      </Text>
+                    </TouchableOpacity>
+                  ) : (
+                    <View
+                      style={[
+                        styles.actionBtn,
+                        {
+                          backgroundColor: "rgba(255, 255, 255, 0.05)",
+                          borderColor: "rgba(255, 255, 255, 0.1)",
+                        },
+                      ]}
+                    >
+                      <Ionicons
+                        name="lock-closed"
+                        size={16}
+                        color="#94A3B8"
+                        style={{ marginRight: 8 }}
+                      />
+                      <Text
+                        style={[styles.actionBtnText, { color: "#94A3B8" }]}
+                      >
+                        FINISH ALL PINS TO UNLOCK FSR
+                      </Text>
+                    </View>
+                  )}
+                </View>
+              )}
+              {(fsrDone || phase === "completed") && (
+                <View style={styles.completedBadge}>
+                  <Ionicons
+                    name="checkmark-circle"
+                    size={16}
+                    color="#10B981"
+                    style={{ marginRight: 6 }}
+                  />
+                  <Text style={styles.completedText}>FSR COMPLETED</Text>
+                </View>
+              )}
+            </BlurView>
+
+            {/* 4. LEAVE SITE (NEW CARD) */}
+            <BlurView
+              intensity={20}
+              tint="dark"
+              style={[
+                styles.workflowCard,
+                !fsrDone && phase !== "completed" && styles.cardDisabled,
+                phase === "completed" && styles.cardCompleted,
+              ]}
+            >
+              <View style={styles.cardHeader}>
+                <Ionicons
+                  name="exit"
+                  size={20}
+                  color={
+                    phase === "completed"
+                      ? "#10B981"
+                      : fsrDone
+                        ? "#F59E0B"
+                        : "#64748B"
+                  }
+                />
+                <Text style={styles.cardTitle}>4. LEAVE SITE</Text>
+              </View>
+              <Text style={styles.cardDescription}>
+                Log out of the facility and formally complete this job.
+              </Text>
+
+              {fsrDone && phase !== "completed" && (
+                <TouchableOpacity
+                  style={[
+                    styles.actionBtn,
+                    {
+                      backgroundColor: "#F59E0B",
+                      borderColor: "#F59E0B",
+                      marginTop: 10,
+                    },
+                  ]}
+                  onPress={() => handleManualEvent("site_exited")}
+                >
+                  <Ionicons
+                    name="exit-outline"
+                    size={20}
+                    color="#080C18"
+                    style={{ marginRight: 8 }}
+                  />
+                  <Text style={[styles.actionBtnText, { color: "#080C18" }]}>
+                    COMPLETE JOB & LEAVE SITE
+                  </Text>
+                </TouchableOpacity>
+              )}
+              {phase === "completed" && (
+                <View style={styles.completedBadge}>
+                  <Ionicons
+                    name="checkmark-circle"
+                    size={16}
+                    color="#10B981"
+                    style={{ marginRight: 6 }}
+                  />
+                  <Text style={styles.completedText}>JOB COMPLETED</Text>
+                </View>
+              )}
+            </BlurView>
+          </View>
+        </ScrollView>
       </SafeAreaView>
+
+      {/* ── FULL SCREEN CAMERA WITH GHOST OVERLAY ── */}
+      <Modal
+        visible={showCamera}
+        animationType="slide"
+        transparent={false}
+        onRequestClose={() => setShowCamera(false)}
+      >
+        <View style={styles.tptModal}>
+          <View style={styles.tptModalHeader}>
+            <Text style={styles.tptModalTitle}>
+              {cameraTarget === "before" ? "BEFORE PHOTO" : "AFTER PHOTO"}
+            </Text>
+            <TouchableOpacity onPress={() => setShowCamera(false)}>
+              <Ionicons name="close" size={24} color="#94A3B8" />
+            </TouchableOpacity>
+          </View>
+          <View style={styles.tptCameraWrap}>
+            <CameraView
+              ref={cameraRef}
+              style={StyleSheet.absoluteFill}
+              facing="back"
+              zoom={0}
+            />
+
+            {/* 🚀 Ghost Before Photo Display (Pin Specific) */}
+            {cameraTarget === "after" &&
+              selectedPin &&
+              pinStatuses[selectedPin.id]?.beforeUri && (
+                <View style={styles.cameraReference}>
+                  <Text style={styles.cameraReferenceText}>BEFORE</Text>
+                  <Image
+                    source={{ uri: pinStatuses[selectedPin.id].beforeUri }}
+                    style={styles.cameraReferenceImg}
+                    resizeMode="cover"
+                  />
+                </View>
+              )}
+
+            <View style={styles.cameraControls}>
+              <View style={{ width: 52 }} />
+              <TouchableOpacity onPress={takePicture} style={styles.captureBtn}>
+                <View style={styles.captureInner} />
+              </TouchableOpacity>
+              <View style={{ width: 52 }} />
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       {/* ── Pin Modal ── */}
       <Modal
@@ -1280,11 +1471,6 @@ export default function SLDMapScreen({ navigation, route }: any) {
                   {selectedPin?.label
                     ? selectedPin.label
                     : `Pin #${selectedPin?.id}`}
-                </Text>
-                <Text style={styles.modalSub}>
-                  {selectedPin
-                    ? `${selectedPin.x_percent.toFixed(0)}% · ${selectedPin.y_percent.toFixed(0)}%`
-                    : ""}
                 </Text>
               </View>
               <TouchableOpacity onPress={closeModal} style={styles.closeBtn}>
@@ -1337,87 +1523,6 @@ export default function SLDMapScreen({ navigation, route }: any) {
           </View>
         </View>
       </Modal>
-
-      {/* ── TPT Camera Modal ── */}
-      <Modal
-        visible={showTptCamera}
-        animationType="slide"
-        transparent={false}
-        onRequestClose={() => {
-          setShowTptCamera(false);
-          setTptUri(null);
-        }}
-      >
-        <View style={styles.tptModal}>
-          <View style={styles.tptModalHeader}>
-            <Text style={styles.tptModalTitle}>TOOLBOX TALK PHOTO</Text>
-            <TouchableOpacity
-              onPress={() => {
-                setShowTptCamera(false);
-                setTptUri(null);
-              }}
-            >
-              <Ionicons name="close" size={24} color="#94A3B8" />
-            </TouchableOpacity>
-          </View>
-          <Text style={styles.tptModalSub}>
-            Photograph your team's toolbox talk before work begins.
-          </Text>
-          {tptUri ? (
-            <View style={styles.tptPreviewWrap}>
-              <Image
-                source={{ uri: tptUri }}
-                style={styles.tptPreviewImg}
-                resizeMode="cover"
-              />
-              <View style={styles.photoActions}>
-                <TouchableOpacity
-                  style={styles.retakeBtn}
-                  onPress={() => setTptUri(null)}
-                >
-                  <Ionicons name="camera" size={16} color="#94A3B8" />
-                  <Text style={styles.retakeBtnText}>Retake</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[
-                    styles.confirmBtn,
-                    tptUploading && styles.btnDisabled,
-                  ]}
-                  onPress={uploadTptPhoto}
-                  disabled={tptUploading}
-                >
-                  {tptUploading ? (
-                    <ActivityIndicator color="#080C18" size="small" />
-                  ) : (
-                    <>
-                      <Ionicons name="checkmark" size={16} color="#080C18" />
-                      <Text style={styles.confirmBtnText}>Confirm</Text>
-                    </>
-                  )}
-                </TouchableOpacity>
-              </View>
-            </View>
-          ) : (
-            <View style={styles.tptCameraWrap}>
-              <CameraView
-                ref={tptCameraRef}
-                style={StyleSheet.absoluteFill}
-                facing="back"
-              />
-              <View style={styles.cameraControls}>
-                <View style={{ width: 52 }} />
-                <TouchableOpacity
-                  onPress={takeTptPicture}
-                  style={styles.captureBtn}
-                >
-                  <View style={styles.captureInner} />
-                </TouchableOpacity>
-                <View style={{ width: 52 }} />
-              </View>
-            </View>
-          )}
-        </View>
-      </Modal>
     </LinearGradient>
   );
 }
@@ -1425,27 +1530,6 @@ export default function SLDMapScreen({ navigation, route }: any) {
 const styles = StyleSheet.create({
   container: { flex: 1 },
   safeArea: { flex: 1 },
-  centered: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-    padding: 24,
-  },
-  noDiagramText: {
-    color: "#475569",
-    fontSize: 16,
-    marginTop: 16,
-    textAlign: "center",
-  },
-  goBackBtn: {
-    marginTop: 24,
-    paddingHorizontal: 24,
-    paddingVertical: 12,
-    backgroundColor: "#1E2A45",
-    borderRadius: 12,
-  },
-  goBackBtnText: { color: "#0EA5E9", fontWeight: "bold" },
-
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -1474,121 +1558,38 @@ const styles = StyleSheet.create({
   },
   headerSub: { fontSize: 11, color: "#94A3B8", letterSpacing: 1, marginTop: 2 },
 
-  stepper: {
+  syncBtn: {
     flexDirection: "row",
-    alignItems: "flex-start",
+    gap: 6,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "rgba(245, 158, 11, 0.15)",
     justifyContent: "center",
-    paddingVertical: 14,
-    paddingHorizontal: 12,
-    backgroundColor: "#0A0F1E",
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "rgba(245, 158, 11, 0.4)",
+  },
+  syncBtnText: { color: "#F59E0B", fontSize: 12, fontWeight: "900" },
+  offlineBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    paddingVertical: 6,
+    backgroundColor: "#0D1120",
     borderBottomWidth: 1,
     borderBottomColor: "#1E2A45",
   },
-  stepItem: { alignItems: "center", width: 52 },
-  stepLine: {
-    flex: 1,
-    height: 2,
-    backgroundColor: "#1E2A45",
-    marginTop: 14,
-    maxWidth: 20,
-  },
-  stepLineDone: { backgroundColor: "#22D3A5" },
-  stepCircle: {
-    width: 30,
-    height: 30,
-    borderRadius: 15,
-    backgroundColor: "#1E2A45",
-    justifyContent: "center",
-    alignItems: "center",
-    borderWidth: 1.5,
-    borderColor: "#2D3A50",
-  },
-  stepCircleDone: { backgroundColor: "#22D3A5", borderColor: "#22D3A5" },
-  stepCircleCurrent: {
-    backgroundColor: "#0EA5E9",
-    borderColor: "#0EA5E9",
-    shadowColor: "#0EA5E9",
-    shadowOpacity: 0.6,
-    shadowRadius: 8,
-    elevation: 4,
-  },
-  stepLabel: {
-    fontSize: 9,
-    color: "#475569",
-    textAlign: "center",
-    marginTop: 5,
-    letterSpacing: 0.3,
-    lineHeight: 13,
-  },
-  stepLabelDone: { color: "#22D3A5" },
-  stepLabelCurrent: { color: "#0EA5E9", fontWeight: "bold" },
-
-  // Flagged strings banner
-  flagBanner: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    marginHorizontal: 12,
-    marginBottom: 4,
-    paddingVertical: 8,
-    paddingHorizontal: 14,
-    backgroundColor: "rgba(239,68,68,0.10)",
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "rgba(239,68,68,0.25)",
-  },
-  flagBannerText: {
-    color: "#FCA5A5",
-    fontSize: 12,
-    fontWeight: "700",
-    letterSpacing: 0.3,
-    flex: 1,
-  },
-
-  ctaCard: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    margin: 12,
-    padding: 14,
-    backgroundColor: "#0A0F1E",
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: "#1E2A45",
-  },
-  ctaCardInfo: { justifyContent: "flex-start", gap: 10 },
-  ctaCardLeft: { flexDirection: "row", alignItems: "center", gap: 12, flex: 1 },
-  ctaIcon: {
-    width: 42,
-    height: 42,
-    borderRadius: 12,
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  ctaTitle: { fontSize: 14, fontWeight: "bold", color: "#F1F5F9" },
-  ctaSubtitle: { fontSize: 11, color: "#475569", marginTop: 2 },
-  ctaBtn: {
-    backgroundColor: "#0EA5E9",
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 10,
-    minWidth: 80,
-    alignItems: "center",
-  },
-  ctaBtnDisabled: { opacity: 0.5 },
-  ctaBtnText: {
-    color: "#080C18",
-    fontWeight: "900",
+  offlineBannerText: {
+    color: "#94A3B8",
     fontSize: 11,
+    fontWeight: "bold",
     letterSpacing: 0.5,
   },
-  ctaInfoText: { fontSize: 13, color: "#94A3B8", flex: 1, lineHeight: 18 },
-
-  progressTrack: { height: 3, backgroundColor: "#1E2A45" },
-  progressFill: { height: 3, backgroundColor: "#22D3A5" },
 
   diagramContainer: {
-    flex: 1,
+    minHeight: 450,
     position: "relative",
     backgroundColor: "#080C18",
   },
@@ -1626,33 +1627,6 @@ const styles = StyleSheet.create({
     marginTop: 10,
     lineHeight: 20,
   },
-
-  // String labels
-  stringLabel: {
-    position: "absolute",
-    transform: [{ translateX: -28 }, { translateY: -10 }],
-    backgroundColor: "rgba(0,0,0,0.72)",
-    borderRadius: 4,
-    paddingHorizontal: 5,
-    paddingVertical: 2,
-  },
-  stringLabelText: { fontSize: 9, fontWeight: "800", letterSpacing: 0.3 },
-
-  stringLabelFlagged: {
-    position: "absolute",
-    transform: [{ translateX: -32 }, { translateY: -12 }],
-    borderRadius: 6,
-    borderWidth: 1,
-    paddingHorizontal: 7,
-    paddingVertical: 3,
-  },
-  stringLabelFlaggedText: {
-    fontSize: 10,
-    fontWeight: "900",
-    letterSpacing: 0.3,
-  },
-
-  // Pins
   pinWrapper: { position: "absolute", alignItems: "center" },
   pinDot: {
     width: PIN_SIZE,
@@ -1681,20 +1655,105 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
 
-  legend: {
+  workflowContainer: {
+    padding: 20,
+    paddingTop: 30,
+    backgroundColor: "#0D1120",
+  },
+  workflowTitle: {
+    fontSize: 12,
+    color: "#64748B",
+    fontWeight: "900",
+    letterSpacing: 2,
+    marginBottom: 16,
+    marginLeft: 4,
+  },
+  workflowCard: {
+    padding: 20,
+    borderRadius: 16,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: "rgba(14, 165, 233, 0.2)",
+    backgroundColor: "rgba(13, 17, 32, 0.7)",
+  },
+  cardDisabled: { opacity: 0.5, borderColor: "#1E2A45" },
+  cardCompleted: { borderColor: "rgba(16, 185, 129, 0.4)" },
+  cardHeader: { flexDirection: "row", alignItems: "center", marginBottom: 12 },
+  cardTitle: {
+    fontSize: 14,
+    fontWeight: "bold",
+    color: "#F1F5F9",
+    marginLeft: 8,
+    letterSpacing: 1,
+  },
+  cardDescription: {
+    fontSize: 12,
+    color: "#94A3B8",
+    lineHeight: 18,
+    marginBottom: 20,
+  },
+  actionBtn: {
+    flexDirection: "row",
+    width: "100%",
+    borderRadius: 12,
+    backgroundColor: "rgba(14, 165, 233, 0.15)",
+    paddingVertical: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "rgba(14, 165, 233, 0.4)",
+  },
+  actionBtnText: {
+    fontSize: 14,
+    fontWeight: "900",
+    color: "#0EA5E9",
+    letterSpacing: 1,
+  },
+  completedBadge: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 14,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderTopWidth: 1,
-    borderTopColor: "#1E2A45",
-    backgroundColor: "#0D1120",
-    flexWrap: "wrap",
+    backgroundColor: "rgba(16, 185, 129, 0.1)",
+    alignSelf: "flex-start",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
   },
-  legendItem: { flexDirection: "row", alignItems: "center", gap: 6 },
-  legendDot: { width: 10, height: 10, borderRadius: 5 },
-  legendText: { fontSize: 11, color: "#94A3B8" },
+  completedText: {
+    color: "#10B981",
+    fontSize: 12,
+    fontWeight: "800",
+    letterSpacing: 1,
+  },
+
+  timerContainer: {
+    alignItems: "center",
+    backgroundColor: "rgba(0,0,0,0.3)",
+    padding: 20,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#1E2A45",
+  },
+  timerLabel: {
+    fontSize: 10,
+    color: "#64748B",
+    fontWeight: "800",
+    letterSpacing: 1.5,
+    marginBottom: 8,
+  },
+  timerValue: {
+    fontSize: 48,
+    fontWeight: "300",
+    color: "#F59E0B",
+    fontVariant: ["tabular-nums"],
+    marginBottom: 20,
+  },
+  actionBtnLocked: {
+    backgroundColor: "rgba(255, 255, 255, 0.05)",
+    borderColor: "rgba(255, 255, 255, 0.1)",
+  },
+  actionBtnReady: { backgroundColor: "#10B981", borderColor: "#10B981" },
+
+  fsrContainer: { marginTop: 10 },
 
   modalOverlay: {
     flex: 1,
@@ -1723,7 +1782,6 @@ const styles = StyleSheet.create({
     color: "#F1F5F9",
     letterSpacing: 1,
   },
-  modalSub: { fontSize: 11, color: "#475569", marginTop: 4 },
   closeBtn: {
     width: 36,
     height: 36,
@@ -1753,7 +1811,6 @@ const styles = StyleSheet.create({
   },
   tabBtnTextActive: { color: "#0EA5E9" },
   modalBody: { minHeight: 280 },
-
   tabContent: {
     padding: 24,
     alignItems: "center",
@@ -1816,12 +1873,33 @@ const styles = StyleSheet.create({
   takePhotoBtnText: { color: "#080C18", fontWeight: "900", fontSize: 15 },
   btnDisabled: { opacity: 0.5 },
 
-  cameraContainer: {
+  tptModal: {
+    flex: 1,
+    backgroundColor: "#080C18",
+    paddingTop: Platform.OS === "ios" ? 52 : 24,
+  },
+  tptModalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingBottom: 8,
+  },
+  tptModalTitle: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#F59E0B",
+    letterSpacing: 2,
+  },
+  tptCameraWrap: {
     width: "100%",
-    height: 320,
+    aspectRatio: 3 / 4,
+    alignSelf: "center",
+    position: "relative",
+    marginVertical: 16,
     borderRadius: 16,
     overflow: "hidden",
-    position: "relative",
+    backgroundColor: "#000",
   },
   cameraControls: {
     position: "absolute",
@@ -1856,7 +1934,6 @@ const styles = StyleSheet.create({
     borderRadius: 28,
     backgroundColor: "#fff",
   },
-
   fieldLabel: {
     alignSelf: "flex-start",
     fontSize: 11,
@@ -1911,39 +1988,31 @@ const styles = StyleSheet.create({
     fontSize: 15,
     letterSpacing: 1,
   },
-
-  tptModal: {
-    flex: 1,
-    backgroundColor: "#080C18",
-    paddingTop: Platform.OS === "ios" ? 52 : 24,
-  },
-  tptModalHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    paddingHorizontal: 16,
-    paddingBottom: 8,
-  },
-  tptModalTitle: {
-    fontSize: 13,
-    fontWeight: "700",
-    color: "#F59E0B",
-    letterSpacing: 2,
-  },
-  tptModalSub: {
-    fontSize: 12,
-    color: "#475569",
-    paddingHorizontal: 16,
-    marginBottom: 16,
-    lineHeight: 18,
-  },
-  tptCameraWrap: {
-    flex: 1,
-    position: "relative",
-    margin: 16,
-    borderRadius: 16,
+  cameraReference: {
+    position: "absolute",
+    top: 16,
+    right: 16,
+    width: 80,
+    aspectRatio: 3 / 4,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: "#22D3A5",
     overflow: "hidden",
+    backgroundColor: "#000",
+    zIndex: 10,
   },
-  tptPreviewWrap: { flex: 1, margin: 16 },
-  tptPreviewImg: { flex: 1, borderRadius: 16, width: "100%" },
+  cameraReferenceText: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    color: "#22D3A5",
+    fontSize: 9,
+    fontWeight: "bold",
+    textAlign: "center",
+    paddingVertical: 2,
+    zIndex: 11,
+  },
+  cameraReferenceImg: { width: "100%", height: "100%", opacity: 0.8 },
 });

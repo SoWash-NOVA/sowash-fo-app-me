@@ -1,6 +1,9 @@
 import { Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { useFocusEffect } from "@react-navigation/native";
 import { BlurView } from "expo-blur";
 import { LinearGradient } from "expo-linear-gradient";
+import * as Network from "expo-network";
 import React, { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
@@ -14,8 +17,9 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-
+import Toast from "react-native-toast-message";
 import apiClient from "../api/client";
+
 import { useAuthStore } from "../store/authStore";
 
 interface Job {
@@ -35,6 +39,151 @@ export default function DashboardScreen({ navigation }: any) {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
+  const [offlineQueue, setOfflineQueue] = useState<any[]>([]);
+  const [isSyncing, setIsSyncing] = useState(false);
+
+  // 🚀 1. Check for offline data when dashboard opens
+  useFocusEffect(
+    React.useCallback(() => {
+      const checkOfflineQueue = async () => {
+        try {
+          const stored = await AsyncStorage.getItem("@sowash_offline_queue");
+          if (stored) {
+            setOfflineQueue(JSON.parse(stored));
+          }
+        } catch (e) {}
+      };
+      checkOfflineQueue();
+    }, []),
+  );
+
+  // 🚀 2. The Master Sync Function
+  const processOfflineQueue = async () => {
+    const network = await Network.getNetworkStateAsync();
+    if (!network.isConnected) {
+      Toast.show({
+        type: "error",
+        text1: "Still Offline",
+        text2: "Connect to internet to sync.",
+      });
+      return;
+    }
+    if (offlineQueue.length === 0) return;
+
+    setIsSyncing(true);
+    let remainingQueue = [...offlineQueue];
+
+    for (const action of offlineQueue) {
+      try {
+        if (action.type === "EVENT") {
+          await apiClient.patch(
+            `/api/mideast/jobs/${action.jobId}/event`,
+            action.payload,
+          );
+        } else if (action.type === "PHOTO") {
+          const form = new FormData();
+          form.append("photo", {
+            uri: action.payload.uri,
+            type: "image/jpeg",
+            name: action.payload.name,
+          } as any);
+          form.append("point_id", action.payload.point_id);
+          form.append("photo_type", action.payload.photo_type);
+          form.append("taken_at", action.payload.taken_at);
+
+          await apiClient.post(
+            `/api/mideast/point-photos/job/${action.jobId}`,
+            form,
+            {
+              headers: { "Content-Type": "multipart/form-data" },
+            },
+          );
+        } else if (action.type === "ANNOTATION") {
+          await apiClient.post(
+            `/api/mideast/fo-annotations/job/${action.jobId}`,
+            action.payload,
+          );
+        } else if (action.type === "TPT") {
+          const form = new FormData();
+          form.append("photo", {
+            uri: action.payload.uri,
+            type: "image/jpeg",
+            name: "tpt.jpg",
+          } as any);
+          form.append("taken_at", action.payload.taken_at);
+
+          await apiClient.post(
+            `/api/mideast/jobs/${action.jobId}/tpt-photo`,
+            form,
+            {
+              headers: { "Content-Type": "multipart/form-data" },
+            },
+          );
+        } else if (action.type === "FSR") {
+          const form = new FormData();
+
+          // Add the signature image
+          form.append("signature", {
+            uri: action.payload.signatureUri,
+            type: "image/png",
+            name: "signature.png",
+          } as any);
+
+          // Safely cast everything else to strings
+          form.append("panels_cleaned", String(action.payload.panels_cleaned));
+          form.append("observations", String(action.payload.observations));
+          form.append("work_done", String(action.payload.work_done));
+          form.append("submitted_at", String(action.payload.submitted_at));
+          form.append(
+            "cable_condition",
+            String(action.payload.cable_condition),
+          );
+          form.append("cable_quantity", String(action.payload.cable_quantity));
+          form.append("panel_damage", String(action.payload.panel_damage));
+          form.append("panel_brand", String(action.payload.panel_brand));
+          form.append("inverter_alarm", String(action.payload.inverter_alarm));
+          form.append("alarm_code", String(action.payload.alarm_code));
+          form.append(
+            "potential_shading",
+            String(action.payload.potential_shading),
+          );
+          form.append(
+            "shading_details",
+            String(action.payload.shading_details),
+          );
+          form.append("rusting", String(action.payload.rusting));
+          form.append("bird_dropping", String(action.payload.bird_dropping));
+          form.append("mos_and_debris", String(action.payload.mos_and_debris));
+          form.append("earthing", String(action.payload.earthing));
+
+          // Post to your backend (using apiClient or fetch)
+          await apiClient.post(`/api/mideast/jobs/${action.jobId}/fsr`, form, {
+            headers: { "Content-Type": "multipart/form-data" },
+          });
+        }
+
+        // Remove from queue upon success
+        remainingQueue = remainingQueue.filter((q) => q.id !== action.id);
+        setOfflineQueue(remainingQueue);
+        await AsyncStorage.setItem(
+          "@sowash_offline_queue",
+          JSON.stringify(remainingQueue),
+        );
+      } catch (e) {
+        console.log("Failed to sync item", action.id);
+      }
+    }
+
+    setIsSyncing(false);
+    if (remainingQueue.length === 0) {
+      Toast.show({
+        type: "success",
+        text1: "Sync Complete!",
+        text2: "All offline data uploaded.",
+      });
+      // If you have a fetchJobs() function, call it here!
+    }
+  };
   const userName = useAuthStore((state) => state.userName);
 
   const fetchJobs = async () => {
@@ -90,6 +239,39 @@ export default function DashboardScreen({ navigation }: any) {
     const safeId = item?.id || item?.job_id || "N/A"; // Check both id and job_id
     const safeSiteName = item?.site_name || "Unknown Site";
     const safeLocation = item?.location || "Location Not Specified";
+
+    {
+      offlineQueue.length > 0 && (
+        <TouchableOpacity
+          onPress={processOfflineQueue}
+          style={{
+            flexDirection: "row",
+            alignItems: "center",
+            justifyContent: "center",
+            backgroundColor: "#F59E0B",
+            padding: 12,
+            margin: 16,
+            borderRadius: 12,
+          }}
+        >
+          {isSyncing ? (
+            <ActivityIndicator color="#080C18" />
+          ) : (
+            <>
+              <Ionicons
+                name="cloud-upload"
+                size={20}
+                color="#080C18"
+                style={{ marginRight: 8 }}
+              />
+              <Text style={{ color: "#080C18", fontWeight: "bold" }}>
+                TAP TO SYNC {offlineQueue.length} PENDING ITEMS
+              </Text>
+            </>
+          )}
+        </TouchableOpacity>
+      );
+    }
 
     return (
       <BlurView intensity={20} tint="dark" style={styles.card}>
