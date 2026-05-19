@@ -121,43 +121,65 @@ export default function DashboardScreen({ navigation }: any) {
           );
         } else if (action.type === "FSR") {
           const form = new FormData();
-
-          // Add the signature image
           form.append("signature", {
             uri: action.payload.signatureUri,
             type: "image/png",
             name: "signature.png",
           } as any);
 
-          // Safely cast everything else to strings
-          form.append("panels_cleaned", String(action.payload.panels_cleaned));
-          form.append("observations", String(action.payload.observations));
-          form.append("work_done", String(action.payload.work_done));
-          form.append("submitted_at", String(action.payload.submitted_at));
+          // Safely cast to string, defaulting to empty string if missing
+          form.append(
+            "panels_cleaned",
+            String(action.payload.panels_cleaned || "0"),
+          );
+          form.append(
+            "observations",
+            String(action.payload.observations || ""),
+          );
+          form.append("work_done", String(action.payload.work_done || ""));
+          form.append(
+            "submitted_at",
+            String(action.payload.submitted_at || ""),
+          );
           form.append(
             "cable_condition",
-            String(action.payload.cable_condition),
+            String(action.payload.cable_condition || ""),
           );
-          form.append("cable_quantity", String(action.payload.cable_quantity));
-          form.append("panel_damage", String(action.payload.panel_damage));
-          form.append("panel_brand", String(action.payload.panel_brand));
-          form.append("inverter_alarm", String(action.payload.inverter_alarm));
-          form.append("alarm_code", String(action.payload.alarm_code));
+          form.append(
+            "cable_quantity",
+            String(action.payload.cable_quantity || ""),
+          );
+          form.append(
+            "panel_damage",
+            String(action.payload.panel_damage || ""),
+          );
+          form.append("panel_brand", String(action.payload.panel_brand || ""));
+          form.append(
+            "inverter_alarm",
+            String(action.payload.inverter_alarm || ""),
+          );
+          form.append("alarm_code", String(action.payload.alarm_code || ""));
           form.append(
             "potential_shading",
-            String(action.payload.potential_shading),
+            String(action.payload.potential_shading || ""),
           );
           form.append(
             "shading_details",
-            String(action.payload.shading_details),
+            String(action.payload.shading_details || ""),
           );
-          form.append("rusting", String(action.payload.rusting));
-          form.append("bird_dropping", String(action.payload.bird_dropping));
-          form.append("mos_and_debris", String(action.payload.mos_and_debris));
-          form.append("earthing", String(action.payload.earthing));
+          form.append("rusting", String(action.payload.rusting || "false"));
+          form.append(
+            "bird_dropping",
+            String(action.payload.bird_dropping || "false"),
+          );
+          form.append(
+            "mos_and_debris",
+            String(action.payload.mos_and_debris || "false"),
+          );
+          form.append("earthing", String(action.payload.earthing || "false"));
 
-          // Post to your backend (using apiClient or fetch)
-          await apiClient.post(`/api/mideast/jobs/${action.jobId}/fsr`, form, {
+          // 🚀 THE FIX: Pointed to the correct FSR route (/fsrs/job/)
+          await apiClient.post(`/api/mideast/fsrs/job/${action.jobId}`, form, {
             headers: { "Content-Type": "multipart/form-data" },
           });
         }
