@@ -388,24 +388,28 @@ export default function SLDMapScreen({ navigation, route }: any) {
       const res = await fetch(`${SERVER_BASE}/api/mideast/jobs/${jobId}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (!res.ok) return;
-      const data = await res.json();
-      const status = data.job?.status ?? "scheduled";
+      const data = res.ok ? await res.json() : null;
+      const status = data?.job?.status ?? "scheduled";
       const stepVal = STATUS_TO_STEP[status] ?? -1;
       setJobStep(stepVal);
 
-      // 🚀 CRITICAL FIX: Check the offline queue FIRST!
+      // 🚀 CRITICAL FIX: Only set the map to 'completed' if they actually left the site!
       const stored = await AsyncStorage.getItem(OFFLINE_QUEUE_KEY);
-      let isOfflineCompleted = false;
+      let hasOfflineExit = false;
+
       if (stored) {
         const q = JSON.parse(stored);
-        isOfflineCompleted = q.some(
-          (item: any) => item.type === "FSR" && item.jobId === jobId,
+        // Look for the site_exited event, NOT the FSR!
+        hasOfflineExit = q.some(
+          (item: any) =>
+            item.type === "EVENT" &&
+            item.jobId === jobId &&
+            item.payload?.event === "site_exited",
         );
       }
 
-      // If FSR is in the queue, force it to 'completed' so the button stays locked!
-      if (isOfflineCompleted || stepVal >= 4) {
+      // ONLY set phase to completed if the server says so OR they clicked Leave Site!
+      if (hasOfflineExit || stepVal >= 4) {
         setPhase("completed");
       } else if (stepVal >= 1) {
         setPhase("at_panel");
