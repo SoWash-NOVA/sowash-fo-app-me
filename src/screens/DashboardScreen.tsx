@@ -4,6 +4,7 @@ import { useFocusEffect } from "@react-navigation/native";
 import { BlurView } from "expo-blur";
 import { LinearGradient } from "expo-linear-gradient";
 import * as Network from "expo-network";
+import * as SecureStore from "expo-secure-store";
 import React, { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
@@ -19,6 +20,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import Toast from "react-native-toast-message";
 import apiClient from "../api/client";
+const SERVER_BASE = "https://app.sowashusa.com";
 
 import { useAuthStore } from "../store/authStore";
 
@@ -71,15 +73,24 @@ export default function DashboardScreen({ navigation }: any) {
     if (offlineQueue.length === 0) return;
 
     setIsSyncing(true);
+    const token = await SecureStore.getItemAsync("userToken");
     let remainingQueue = [...offlineQueue];
 
     for (const action of offlineQueue) {
       try {
         if (action.type === "EVENT") {
-          await apiClient.patch(
-            `/api/mideast/jobs/${action.jobId}/event`,
-            action.payload,
+          const res = await fetch(
+            `${SERVER_BASE}/api/mideast/jobs/${action.jobId}/event`,
+            {
+              method: "PATCH",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(action.payload),
+            },
           );
+          if (!res.ok) throw new Error(await res.text());
         } else if (action.type === "PHOTO") {
           const form = new FormData();
           form.append("photo", {
@@ -90,19 +101,28 @@ export default function DashboardScreen({ navigation }: any) {
           form.append("point_id", action.payload.point_id);
           form.append("photo_type", action.payload.photo_type);
           form.append("taken_at", action.payload.taken_at);
-
-          await apiClient.post(
-            `/api/mideast/point-photos/job/${action.jobId}`,
-            form,
+          const res = await fetch(
+            `${SERVER_BASE}/api/mideast/point-photos/job/${action.jobId}`,
             {
-              headers: { "Content-Type": "multipart/form-data" },
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}` },
+              body: form,
             },
           );
+          if (!res.ok) throw new Error(await res.text());
         } else if (action.type === "ANNOTATION") {
-          await apiClient.post(
-            `/api/mideast/fo-annotations/job/${action.jobId}`,
-            action.payload,
+          const res = await fetch(
+            `${SERVER_BASE}/api/mideast/fo-annotations/job/${action.jobId}`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(action.payload),
+            },
           );
+          if (!res.ok) throw new Error(await res.text());
         } else if (action.type === "TPT") {
           const form = new FormData();
           form.append("photo", {
@@ -111,14 +131,15 @@ export default function DashboardScreen({ navigation }: any) {
             name: "tpt.jpg",
           } as any);
           form.append("taken_at", action.payload.taken_at);
-
-          await apiClient.post(
-            `/api/mideast/jobs/${action.jobId}/tpt-photo`,
-            form,
+          const res = await fetch(
+            `${SERVER_BASE}/api/mideast/jobs/${action.jobId}/tpt-photo`,
             {
-              headers: { "Content-Type": "multipart/form-data" },
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}` },
+              body: form,
             },
           );
+          if (!res.ok) throw new Error(await res.text());
         } else if (action.type === "FSR") {
           const form = new FormData();
           form.append("signature", {
@@ -126,47 +147,24 @@ export default function DashboardScreen({ navigation }: any) {
             type: "image/png",
             name: "signature.png",
           } as any);
-
-          // Safely cast to string, defaulting to empty string if missing
           form.append(
             "panels_cleaned",
             String(action.payload.panels_cleaned || "0"),
           );
-          form.append(
-            "observations",
-            String(action.payload.observations || ""),
-          );
-          form.append("work_done", String(action.payload.work_done || ""));
-          form.append(
-            "submitted_at",
-            String(action.payload.submitted_at || ""),
-          );
-          form.append(
-            "cable_condition",
-            String(action.payload.cable_condition || ""),
-          );
-          form.append(
-            "cable_quantity",
-            String(action.payload.cable_quantity || ""),
-          );
-          form.append(
-            "panel_damage",
-            String(action.payload.panel_damage || ""),
-          );
-          form.append("panel_brand", String(action.payload.panel_brand || ""));
-          form.append(
-            "inverter_alarm",
-            String(action.payload.inverter_alarm || ""),
-          );
-          form.append("alarm_code", String(action.payload.alarm_code || ""));
+          form.append("observations", action.payload.observations || "");
+          form.append("work_done", action.payload.work_done || "");
+          form.append("submitted_at", action.payload.submitted_at || "");
+          form.append("cable_condition", action.payload.cable_condition || "");
+          form.append("cable_quantity", action.payload.cable_quantity || "");
+          form.append("panel_damage", action.payload.panel_damage || "");
+          form.append("panel_brand", action.payload.panel_brand || "");
+          form.append("inverter_alarm", action.payload.inverter_alarm || "");
+          form.append("alarm_code", action.payload.alarm_code || "");
           form.append(
             "potential_shading",
-            String(action.payload.potential_shading || ""),
+            action.payload.potential_shading || "",
           );
-          form.append(
-            "shading_details",
-            String(action.payload.shading_details || ""),
-          );
+          form.append("shading_details", action.payload.shading_details || "");
           form.append("rusting", String(action.payload.rusting || "false"));
           form.append(
             "bird_dropping",
@@ -177,35 +175,48 @@ export default function DashboardScreen({ navigation }: any) {
             String(action.payload.mos_and_debris || "false"),
           );
           form.append("earthing", String(action.payload.earthing || "false"));
-
-          // 🚀 THE FIX: Pointed to the correct FSR route (/fsrs/job/)
-          await apiClient.post(`/api/mideast/fsrs/job/${action.jobId}`, form, {
-            headers: { "Content-Type": "multipart/form-data" },
-          });
+          const res = await fetch(
+            `${SERVER_BASE}/api/mideast/fsrs/job/${action.jobId}`,
+            {
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}` },
+              body: form,
+            },
+          );
+          // 409 = already submitted (synced twice) → treat as success, remove from queue
+          if (!res.ok && res.status !== 409) throw new Error(await res.text());
         }
 
-        // Remove from queue upon success
+        // ✅ Remove from queue on success and persist immediately
         remainingQueue = remainingQueue.filter((q) => q.id !== action.id);
         setOfflineQueue(remainingQueue);
         await AsyncStorage.setItem(
           "@sowash_offline_queue",
           JSON.stringify(remainingQueue),
         );
-      } catch (e) {
-        console.log("Failed to sync item", action.id);
+      } catch (e: any) {
+        console.error("Sync failed for action:", action.id, e.message);
+        // Don't break the loop — try remaining items
       }
     }
 
     setIsSyncing(false);
+
     if (remainingQueue.length === 0) {
       Toast.show({
         type: "success",
         text1: "Sync Complete!",
         text2: "All offline data uploaded.",
       });
-      // If you have a fetchJobs() function, call it here!
+    } else {
+      Toast.show({
+        type: "info",
+        text1: "Partial Sync",
+        text2: `${remainingQueue.length} items failed. Will retry.`,
+      });
     }
   };
+
   const userName = useAuthStore((state) => state.userName);
 
   const fetchJobs = async () => {
@@ -217,7 +228,7 @@ export default function DashboardScreen({ navigation }: any) {
       );
       setJobs(response.data.jobs || response.data || []);
     } catch (error) {
-      console.error("Backend fetch failed. Displaying empty queue.", error);
+      console.warn("Backend fetch failed. Displaying empty queue.", error);
       setJobs([]);
     } finally {
       setLoading(false);
@@ -261,39 +272,6 @@ export default function DashboardScreen({ navigation }: any) {
     const safeId = item?.id || item?.job_id || "N/A"; // Check both id and job_id
     const safeSiteName = item?.site_name || "Unknown Site";
     const safeLocation = item?.location || "Location Not Specified";
-
-    {
-      offlineQueue.length > 0 && (
-        <TouchableOpacity
-          onPress={processOfflineQueue}
-          style={{
-            flexDirection: "row",
-            alignItems: "center",
-            justifyContent: "center",
-            backgroundColor: "#F59E0B",
-            padding: 12,
-            margin: 16,
-            borderRadius: 12,
-          }}
-        >
-          {isSyncing ? (
-            <ActivityIndicator color="#080C18" />
-          ) : (
-            <>
-              <Ionicons
-                name="cloud-upload"
-                size={20}
-                color="#080C18"
-                style={{ marginRight: 8 }}
-              />
-              <Text style={{ color: "#080C18", fontWeight: "bold" }}>
-                TAP TO SYNC {offlineQueue.length} PENDING ITEMS
-              </Text>
-            </>
-          )}
-        </TouchableOpacity>
-      );
-    }
 
     return (
       <BlurView intensity={20} tint="dark" style={styles.card}>
@@ -372,6 +350,40 @@ export default function DashboardScreen({ navigation }: any) {
 
           <View style={{ width: 44 }} />
         </View>
+
+        {/* 🔄 Offline Sync Banner */}
+        {offlineQueue.length > 0 && (
+          <TouchableOpacity
+            onPress={processOfflineQueue}
+            disabled={isSyncing}
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              justifyContent: "center",
+              backgroundColor: "#F59E0B",
+              padding: 12,
+              marginHorizontal: 16,
+              marginTop: 8,
+              borderRadius: 12,
+            }}
+          >
+            {isSyncing ? (
+              <ActivityIndicator color="#080C18" />
+            ) : (
+              <>
+                <Ionicons
+                  name="cloud-upload"
+                  size={20}
+                  color="#080C18"
+                  style={{ marginRight: 8 }}
+                />
+                <Text style={{ color: "#080C18", fontWeight: "bold" }}>
+                  TAP TO SYNC {offlineQueue.length} PENDING ITEMS
+                </Text>
+              </>
+            )}
+          </TouchableOpacity>
+        )}
 
         {loading ? (
           <View style={styles.center}>

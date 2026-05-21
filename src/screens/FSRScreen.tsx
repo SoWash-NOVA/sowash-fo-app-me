@@ -1,7 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { DrawerNavigationProp } from "@react-navigation/drawer";
 import { RouteProp, useNavigation, useRoute } from "@react-navigation/native";
-import * as Network from "expo-network";
+import { NativeStackNavigationProp } from "@react-navigation/native-stack";
+import * as FileSystem from "expo-file-system/legacy";
 import * as SecureStore from "expo-secure-store";
 import React, { useRef, useState } from "react";
 
@@ -25,12 +25,15 @@ import SignatureScreen, {
 } from "react-native-signature-canvas";
 import Toast from "react-native-toast-message";
 
-type RootParamList = {
+// FSRScreen lives in the ROOT Stack (RootNavigator), not the Drawer
+type RootStackParamList = {
   FSRScreen: { jobId: number | string };
-  JobOrders: undefined;
+  MainDrawer: { screen: string };
+  SLDMap: any;
+  Login: undefined;
 };
-type FSRRouteProp = RouteProp<RootParamList, "FSRScreen">;
-type FSRNavProp = DrawerNavigationProp<RootParamList>;
+type FSRRouteProp = RouteProp<RootStackParamList, "FSRScreen">;
+type FSRNavProp = NativeStackNavigationProp<RootStackParamList, "FSRScreen">;
 
 const SERVER_BASE = "https://app.sowashusa.com";
 const BG = "#080C18";
@@ -227,6 +230,46 @@ export default function FSRScreen() {
     return null;
   };
 
+  // ─── Helper: build FormData from payload + a real file URI ──────────────────
+  const buildFsrForm = (payload: any, fileUri: string): FormData => {
+    const form = new FormData();
+    form.append("signature", {
+      uri: fileUri,
+      type: "image/png",
+      name: "signature.png",
+    } as any);
+    form.append("panels_cleaned", payload.panels_cleaned);
+    form.append("observations", payload.observations);
+    form.append("work_done", payload.work_done);
+    form.append("submitted_at", payload.submitted_at);
+    form.append("cable_condition", payload.cable_condition);
+    form.append("cable_quantity", payload.cable_quantity);
+    form.append("panel_damage", payload.panel_damage);
+    form.append("panel_brand", payload.panel_brand);
+    form.append("inverter_alarm", payload.inverter_alarm);
+    form.append("alarm_code", payload.alarm_code);
+    form.append("potential_shading", payload.potential_shading);
+    form.append("shading_details", payload.shading_details);
+    form.append("rusting", payload.rusting);
+    form.append("bird_dropping", payload.bird_dropping);
+    form.append("mos_and_debris", payload.mos_and_debris);
+    form.append("earthing", payload.earthing);
+    return form;
+  };
+
+  // ─── Helper: save base64 data URI → real temp file, return file:// URI ──────
+  const saveSignatureToFile = async (
+    base64DataUri: string,
+  ): Promise<string> => {
+    // Strip the "data:image/png;base64," prefix
+    const base64 = base64DataUri.replace(/^data:image\/\w+;base64,/, "");
+    const fileUri = `${FileSystem.cacheDirectory}fsr_sig_${Date.now()}.png`;
+    await FileSystem.writeAsStringAsync(fileUri, base64, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    return fileUri;
+  };
+
   const handleSubmit = async () => {
     const err = validate();
     if (err) {
@@ -237,9 +280,23 @@ export default function FSRScreen() {
     const performedAt = new Date().toISOString();
     setSubmitting(true);
 
-    // 🚀 Bundle all data so it can be saved locally if offline
+    // 1. Save the base64 signature to a real temp file immediately.
+    //    This works for BOTH online and offline paths.
+    let signatureFileUri: string;
+    try {
+      signatureFileUri = await saveSignatureToFile(signatureData!);
+    } catch (e) {
+      Toast.show({
+        type: "error",
+        text1: "Signature Error",
+        text2: "Could not save signature. Please retry.",
+      });
+      setSubmitting(false);
+      return;
+    }
+
     const payload = {
-      signatureUri: signatureData,
+      signatureUri: signatureFileUri, // ← always a real file:// URI now
       panels_cleaned: String(parseInt(panelsCleaned || "0")),
       observations: observations.trim(),
       work_done: workDone.trim(),
@@ -259,70 +316,9 @@ export default function FSRScreen() {
     };
 
     try {
-      const network = await Network.getNetworkStateAsync();
-
-      // 🛑 OFFLINE MODE: Save to Queue
-      if (!network.isConnected) {
-        const stored = await AsyncStorage.getItem(OFFLINE_QUEUE_KEY);
-        const queue = stored ? JSON.parse(stored) : [];
-
-        // 1. Queue the FSR
-        queue.push({
-          id: Date.now().toString() + "_fsr",
-          type: "FSR",
-          jobId: jobId,
-          payload: payload,
-        });
-
-        // 2. Queue the "Exit Site" event with the EXACT morning timestamp!
-        queue.push({
-          id: Date.now().toString() + "_exit",
-          type: "EVENT",
-          jobId: jobId,
-          payload: {
-            event: "site_exited",
-            timestamp: performedAt,
-            lat: null,
-            lng: null,
-          },
-        });
-
-        await AsyncStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
-        Toast.show({
-          type: "info",
-          text1: "FSR Saved Offline",
-          text2: "Tap the Cloud Sync icon on the map when online.",
-        });
-
-        // 🚀 Go back to the Map screen
-        navigation.goBack();
-        return;
-      }
-
-      // 🟢 ONLINE MODE: Normal Upload
+      // 🟢 2. TRY ONLINE
       const token = await getToken();
-      const form = new FormData();
-      form.append("signature", {
-        uri: signatureData!,
-        type: "image/png",
-        name: "signature.png",
-      } as any);
-      form.append("panels_cleaned", payload.panels_cleaned);
-      form.append("observations", payload.observations);
-      form.append("work_done", payload.work_done);
-      form.append("submitted_at", payload.submitted_at);
-      form.append("cable_condition", payload.cable_condition);
-      form.append("cable_quantity", payload.cable_quantity);
-      form.append("panel_damage", payload.panel_damage);
-      form.append("panel_brand", payload.panel_brand);
-      form.append("inverter_alarm", payload.inverter_alarm);
-      form.append("alarm_code", payload.alarm_code);
-      form.append("potential_shading", payload.potential_shading);
-      form.append("shading_details", payload.shading_details);
-      form.append("rusting", payload.rusting);
-      form.append("bird_dropping", payload.bird_dropping);
-      form.append("mos_and_debris", payload.mos_and_debris);
-      form.append("earthing", payload.earthing);
+      const form = buildFsrForm(payload, signatureFileUri);
 
       const fsrRes = await fetch(
         `${SERVER_BASE}/api/mideast/fsrs/job/${jobId}`,
@@ -334,43 +330,43 @@ export default function FSRScreen() {
       );
 
       if (!fsrRes.ok) {
-        const body = await fsrRes.json().catch(() => ({}));
-        throw new Error(body?.error || `FSR submit failed (${fsrRes.status})`);
+        // 409 = FSR already exists (duplicate submit) — treat as success
+        if (fsrRes.status !== 409) {
+          const errText = await fsrRes.text();
+          throw new Error(`Server rejected FSR: ${errText}`);
+        }
       }
 
-      fetch(`${SERVER_BASE}/api/mideast/jobs/${jobId}/event`, {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          event: "site_exited",
-          timestamp: performedAt,
-          lat: null,
-          lng: null,
-        }),
-      }).catch(() => {});
-
-      Toast.show({
-        type: "success",
-        text1: "Job Completed!",
-        text2: "FSR submitted successfully.",
-      });
-
-      // 🚀 Go back to the Map screen
-      navigation.goBack();
+      // Mark done BEFORE navigating so a crash can't interrupt the write
+      await AsyncStorage.setItem(`@fsr_done_${String(jobId)}`, "true");
+      Toast.show({ type: "success", text1: "FSR Submitted!" });
+      // FSRScreen is in the Root Stack — navigate back to the Drawer's JobOrders
+      navigation.navigate("MainDrawer", { screen: "JobOrders" });
     } catch (e: any) {
-      Toast.show({
-        type: "error",
-        text1: "Submission Failed",
-        text2: e?.message ?? "Check connection and try again.",
+      // 🛑 3. OFFLINE FALLBACK — payload.signatureUri is already a real file:// path
+      const stored = await AsyncStorage.getItem(OFFLINE_QUEUE_KEY);
+      const queue = stored ? JSON.parse(stored) : [];
+      queue.push({
+        id: Date.now().toString() + "_fsr",
+        type: "FSR",
+        jobId: jobId,
+        payload: payload,
       });
+
+      await AsyncStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
+      await AsyncStorage.setItem(`@fsr_done_${String(jobId)}`, "true");
+
+      Toast.show({
+        type: "info",
+        text1: "Saved Offline",
+        text2: "Will sync when internet returns.",
+      });
+      // Same fix for offline path
+      navigation.navigate("MainDrawer", { screen: "JobOrders" });
     } finally {
       setSubmitting(false);
     }
   };
-
   return (
     <KeyboardAvoidingView
       style={styles.flex}
@@ -601,7 +597,7 @@ export default function FSRScreen() {
             {submitting ? (
               <ActivityIndicator color="#fff" />
             ) : (
-              <Text style={styles.submitText}>SUBMIT & COMPLETE JOB</Text>
+              <Text style={styles.submitText}>SUBMIT FSR & RETURN TO MAP</Text>
             )}
           </TouchableOpacity>
 

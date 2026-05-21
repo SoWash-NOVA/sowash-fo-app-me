@@ -32,7 +32,7 @@ const TABS = ["BEFORE", "ANNOTATE", "AFTER"] as const;
 type Tab = (typeof TABS)[number];
 
 export const SERVER_BASE = "https://app.sowashusa.com";
-const REQUIRED_WAIT_SECONDS = 10 * 60;
+const REQUIRED_WAIT_SECONDS = 1 * 60;
 const OFFLINE_QUEUE_KEY = "@sowash_offline_queue";
 
 type QueuedAction = {
@@ -208,6 +208,7 @@ export default function SLDMapScreen({ navigation, route }: any) {
 
   // ─── OFFLINE MANAGER ───
   // ─── OFFLINE MANAGER ───
+  // ─── OFFLINE MANAGER & FOCUS SYNC ───
   useFocusEffect(
     React.useCallback(() => {
       const checkData = async () => {
@@ -216,11 +217,15 @@ export default function SLDMapScreen({ navigation, route }: any) {
           const stored = await AsyncStorage.getItem(OFFLINE_QUEUE_KEY);
           if (stored) setOfflineQueue(JSON.parse(stored));
 
-          // 2. 🚀 Instantly check if the FSR was completed locally
-          const fsrFlag = await AsyncStorage.getItem(`@fsr_done_${jobId}`);
-          if (fsrFlag === "true") setFsrDone(true);
+          // 2. 🚀 THE FIX: Force jobId to be a string to guarantee the key matches!
+          const fsrFlag = await AsyncStorage.getItem(
+            `@fsr_done_${String(jobId)}`,
+          );
+          if (fsrFlag === "true") {
+            setFsrDone(true);
+          }
 
-          // 3. Re-fetch server status just in case
+          // 3. Check server status
           loadJobStep();
         } catch (e) {}
       };
@@ -317,15 +322,59 @@ export default function SLDMapScreen({ navigation, route }: any) {
             },
           );
         } else if (action.type === "FSR") {
-          // 🚀 NEW: Added FSR Offline handling
-          await fetch(`${SERVER_BASE}/api/mideast/jobs/${action.jobId}/fsr`, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${token}`,
-              "Content-Type": "application/json",
+          const form = new FormData();
+
+          // Signature — must be a real file:// URI (saved by FSRScreen via expo-file-system)
+          form.append("signature", {
+            uri: action.payload.signatureUri,
+            type: "image/png",
+            name: "signature.png",
+          } as any);
+
+          form.append(
+            "panels_cleaned",
+            String(action.payload.panels_cleaned || "0"),
+          );
+          form.append("observations", action.payload.observations || "");
+          form.append("work_done", action.payload.work_done || "");
+          form.append("submitted_at", action.payload.submitted_at || "");
+          form.append("cable_condition", action.payload.cable_condition || "");
+          form.append("cable_quantity", action.payload.cable_quantity || "");
+          form.append("panel_damage", action.payload.panel_damage || "");
+          form.append("panel_brand", action.payload.panel_brand || "");
+          form.append("inverter_alarm", action.payload.inverter_alarm || "");
+          form.append("alarm_code", action.payload.alarm_code || "");
+          form.append(
+            "potential_shading",
+            action.payload.potential_shading || "",
+          );
+          form.append("shading_details", action.payload.shading_details || "");
+          form.append("rusting", String(action.payload.rusting || "false"));
+          form.append(
+            "bird_dropping",
+            String(action.payload.bird_dropping || "false"),
+          );
+          form.append(
+            "mos_and_debris",
+            String(action.payload.mos_and_debris || "false"),
+          );
+          form.append("earthing", String(action.payload.earthing || "false"));
+
+          const fsrRes = await fetch(
+            `${SERVER_BASE}/api/mideast/fsrs/job/${action.jobId}`,
+            {
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}` },
+              body: form,
             },
-            body: JSON.stringify(action.payload),
-          });
+          );
+
+          // 409 = already in DB (synced twice) → remove from queue silently
+          // Any other non-ok status = real failure → throw so item stays in queue
+          if (!fsrRes.ok && fsrRes.status !== 409) {
+            const errText = await fsrRes.text();
+            throw new Error(`FSR sync failed (${fsrRes.status}): ${errText}`);
+          }
         }
 
         // Only removes the item from the queue if the fetch succeeds without throwing an error
@@ -552,7 +601,7 @@ export default function SLDMapScreen({ navigation, route }: any) {
 
       // Go back to the dashboard after a short delay
       setTimeout(() => {
-        navigation.navigate("JobOrders"); // Or navigation.goBack()
+        navigation.navigate("MainDrawer", { screen: "JobOrders" });
       }, 1500);
       return;
     }
