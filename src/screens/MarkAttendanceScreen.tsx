@@ -21,6 +21,10 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { coreApiClient, faceInstance } from "../api/client";
 import { useAuthStore } from "../store/authStore";
+import { useNetInfo } from "@react-native-community/netinfo";
+import * as Network from "expo-network";
+import * as FileSystem from "expo-file-system";
+import { OFFLINE_QUEUE_KEY, OfflineRecord } from "../hooks/useOfflineSync";
 
 const { width } = Dimensions.get("window");
 const SCAN_BOX_SIZE = width * 0.92;
@@ -64,6 +68,31 @@ interface GroupResult {
 export default function MarkAttendanceScreen({ navigation }: any) {
   const [permission, requestPermission] = useCameraPermissions();
   const userName = useAuthStore((state) => state.userName);
+
+  const netInfo = useNetInfo();
+  const [expoOffline, setExpoOffline] = useState(false);
+  const [manualOffline, setManualOffline] = useState(false);
+
+  useEffect(() => {
+    const checkNetwork = async () => {
+      try {
+        const state = await Network.getNetworkStateAsync();
+        // If explicitly disconnected or no internet reachability
+        if (state.isConnected === false || state.isInternetReachable === false) {
+          setExpoOffline(true);
+        } else {
+          setExpoOffline(false);
+        }
+      } catch (e) {}
+    };
+
+    checkNetwork();
+    const interval = setInterval(checkNetwork, 2000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Combine both sources for maximum reliability + manual toggle
+  const isOffline = netInfo.isConnected === false || netInfo.isInternetReachable === false || expoOffline || manualOffline;
 
   const [screenState, setScreenState] = useState<ScreenState>("idle");
   const [pendingAction, setPendingAction] =
@@ -150,7 +179,8 @@ export default function MarkAttendanceScreen({ navigation }: any) {
         !scanningActive.current ||
         captureInProgress.current ||
         isPolling.current ||
-        !cameraRef.current
+        !cameraRef.current ||
+        isOffline
       )
         return;
       isPolling.current = true;
@@ -310,12 +340,113 @@ export default function MarkAttendanceScreen({ navigation }: any) {
         setScreenState("results");
         return;
       }
+      if (!error.response || error.code === "ECONNABORTED" || error.message === "Network Error") {
+        console.log("Network error detected, falling back to offline queue...");
+        try {
+          const captured_at = new Date().toISOString();
+          const uniqueId = Date.now().toString();
+          const newPath = `${FileSystem.documentDirectory}offline_photo_${uniqueId}.jpg`;
+          
+          await FileSystem.copyAsync({
+            from: photo.uri,
+            to: newPath,
+          });
+
+          const newRecord = {
+            id: uniqueId,
+            type: "ATTENDANCE",
+            payload: {
+              photoUri: newPath,
+              action: pendingAction,
+              captured_at,
+            }
+          };
+
+          const queueData = await AsyncStorage.getItem("@sowash_offline_queue");
+          const queue = queueData ? JSON.parse(queueData) : [];
+          queue.push(newRecord);
+          await AsyncStorage.setItem("@sowash_offline_queue", JSON.stringify(queue));
+
+          const res: GroupResult = {
+            name: "Offline Status",
+            status: "warning",
+            message: "Network dropped. Saved locally.",
+            time: captured_at,
+          };
+          await saveToLocalLedger([res]);
+          setResultsList([res]);
+          setScreenState("results");
+          return;
+        } catch (fallbackError) {
+          console.error("Fallback to offline queue failed", fallbackError);
+        }
+      }
+
       Alert.alert(
         "Error",
         error.code === "ECONNABORTED"
           ? "Request timed out."
           : error.response?.data?.message || "Unable to connect.",
       );
+      cancelScan();
+    }
+  };
+
+  const recordAttendanceOffline = async () => {
+    if (captureInProgress.current || !cameraRef.current) return;
+    captureInProgress.current = true;
+    stopScan();
+    setFaceDetected(false);
+    setScreenState("processing");
+
+    try {
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: 0.4,
+        base64: true,
+        skipProcessing: true,
+      });
+      if (!photo?.uri) {
+        Alert.alert("Error", "Could not capture photo.");
+        cancelScan();
+        return;
+      }
+
+      const captured_at = new Date().toISOString();
+      const uniqueId = Date.now().toString();
+      const newPath = `${FileSystem.documentDirectory}offline_photo_${uniqueId}.jpg`;
+      
+      await FileSystem.copyAsync({
+        from: photo.uri,
+        to: newPath,
+      });
+
+      const newRecord = {
+        id: uniqueId,
+        type: "ATTENDANCE",
+        payload: {
+          photoUri: newPath,
+          action: pendingAction,
+          captured_at,
+        }
+      };
+
+      const queueData = await AsyncStorage.getItem("@sowash_offline_queue");
+      const queue = queueData ? JSON.parse(queueData) : [];
+      queue.push(newRecord);
+      await AsyncStorage.setItem("@sowash_offline_queue", JSON.stringify(queue));
+
+      const res: GroupResult = {
+        name: "Offline Status",
+        status: "warning",
+        message: "Saved locally. Will sync when online.",
+        time: captured_at,
+      };
+      await saveToLocalLedger([res]);
+      setResultsList([res]);
+      setScreenState("results");
+
+    } catch (error: any) {
+      Alert.alert("Error", "Failed to capture photo offline.");
       cancelScan();
     }
   };
@@ -426,6 +557,11 @@ export default function MarkAttendanceScreen({ navigation }: any) {
 
         {/* Overlay UI (Scanners, Buttons, Text) remains full screen over the camera */}
         <View style={S.overlay}>
+          {isOffline && (
+            <View style={S.offlineBadgeTop}>
+              <Text style={S.offlineBadgeText}>OFFLINE MODE</Text>
+            </View>
+          )}
           <View
             style={[
               S.overlayBlock,
@@ -476,7 +612,7 @@ export default function MarkAttendanceScreen({ navigation }: any) {
                   />
                 ),
               )}
-              {screenState === "scanning" ? (
+              {screenState === "scanning" && !isOffline ? (
                 <Animated.View
                   style={[
                     S.scanLine,
@@ -484,6 +620,14 @@ export default function MarkAttendanceScreen({ navigation }: any) {
                     faceDetected ? S.scanLineGreen : null,
                   ]}
                 />
+              ) : null}
+              {screenState === "scanning" && isOffline ? (
+                <View style={[S.offlineCaptureContainer, { zIndex: 999 }]}>
+                  <TouchableOpacity onPress={recordAttendanceOffline} style={S.offlineCaptureBtn}>
+                    <Ionicons name="camera" size={36} color="#fff" />
+                  </TouchableOpacity>
+                  <Text style={S.offlineCaptureHint}>Tap to Capture</Text>
+                </View>
               ) : null}
               {screenState === "processing" ? (
                 <View style={S.processingOverlay}>
@@ -505,10 +649,12 @@ export default function MarkAttendanceScreen({ navigation }: any) {
                 style={[S.statusDot, faceDetected ? S.statusDotGreen : null]}
               />
               <Text
-                style={[S.statusText, faceDetected ? S.statusTextGreen : null]}
+                style={[S.statusText, faceDetected ? S.statusTextGreen : null, isOffline ? S.statusTextOffline : null]}
               >
                 {screenState === "processing"
                   ? "Processing..."
+                  : isOffline
+                    ? "Face forward and tap to capture"
                   : faceDetected
                     ? `Faces detected — hold still...`
                     : "Scanning for faces..."}
@@ -630,12 +776,36 @@ export default function MarkAttendanceScreen({ navigation }: any) {
               <View style={S.bigIconCircle}>
                 <Ionicons name="people-outline" size={60} color="#0EA5E9" />
               </View>
+              {isOffline && (
+                <View style={[S.statusBadge, { backgroundColor: '#EF4444', marginBottom: 16, paddingHorizontal: 12, paddingVertical: 6 }]}>
+                  <Text style={[S.statusText, { color: '#FFF', fontSize: 12 }]}>OFFLINE MODE</Text>
+                </View>
+              )}
               <Text style={S.title}>BIOMETRIC LOCK</Text>
               <Text style={S.subtitle}>
-                Scan your face (or your team) {"\n"}to record attendance for{" "}
-                {"\n"}
-                {getPKTDateString()}
+                {isOffline ? "Capture a photo locally to queue for later." : "Scan your face (or your team) \nto record attendance for \n" + getPKTDateString()}
               </Text>
+
+              {/* Force Offline Toggle */}
+              <TouchableOpacity
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  backgroundColor: manualOffline ? "rgba(239, 68, 68, 0.2)" : "rgba(148, 163, 184, 0.1)",
+                  padding: 10,
+                  borderRadius: 12,
+                  marginTop: 20,
+                  marginBottom: 10,
+                  borderWidth: 1,
+                  borderColor: manualOffline ? "#EF4444" : "transparent"
+                }}
+                onPress={() => setManualOffline(!manualOffline)}
+              >
+                <Ionicons name={manualOffline ? "cloud-offline" : "cloud"} size={20} color={manualOffline ? "#EF4444" : "#94A3B8"} style={{ marginRight: 8 }} />
+                <Text style={{ color: manualOffline ? "#EF4444" : "#94A3B8", fontWeight: "bold" }}>
+                  {manualOffline ? "FORCE OFFLINE (ON)" : "FORCE OFFLINE (OFF)"}
+                </Text>
+              </TouchableOpacity>
 
               <TouchableOpacity
                 style={S.clockInBtn}
@@ -647,7 +817,9 @@ export default function MarkAttendanceScreen({ navigation }: any) {
                   color="#10B981"
                   style={{ marginRight: 8 }}
                 />
-                <Text style={S.clockInBtnText}>SCAN TO CLOCK IN</Text>
+                <Text style={S.clockInBtnText}>
+                  {isOffline ? "OFFLINE CLOCK IN" : "SCAN TO CLOCK IN"}
+                </Text>
               </TouchableOpacity>
 
               <TouchableOpacity
@@ -660,7 +832,9 @@ export default function MarkAttendanceScreen({ navigation }: any) {
                   color="#EF4444"
                   style={{ marginRight: 8 }}
                 />
-                <Text style={S.clockOutBtnText}>SCAN TO CLOCK OUT</Text>
+                <Text style={S.clockOutBtnText}>
+                  {isOffline ? "OFFLINE CLOCK OUT" : "SCAN TO CLOCK OUT"}
+                </Text>
               </TouchableOpacity>
             </View>
           </ScrollView>
@@ -942,5 +1116,48 @@ const S = StyleSheet.create({
     fontSize: 14,
     fontWeight: "800",
     letterSpacing: 1,
+  },
+  offlineBadgeTop: {
+    position: "absolute",
+    top: Platform.OS === "android" ? StatusBar.currentHeight || 24 : 40,
+    alignSelf: "center",
+    backgroundColor: "#EF4444",
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+    borderRadius: 20,
+    zIndex: 100,
+  },
+  offlineBadgeText: {
+    color: "#FFFFFF",
+    fontWeight: "900",
+    fontSize: 12,
+    letterSpacing: 1.5,
+  },
+  offlineCaptureContainer: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  offlineCaptureBtn: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: "rgba(239, 68, 68, 0.8)",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 4,
+    borderColor: "rgba(255,255,255,0.4)",
+  },
+  offlineCaptureHint: {
+    marginTop: 12,
+    color: "#FFFFFF",
+    fontSize: 14,
+    fontWeight: "600",
+    textShadowColor: "rgba(0,0,0,0.5)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 4,
+  },
+  statusTextOffline: {
+    color: "#EF4444",
   },
 });

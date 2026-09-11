@@ -185,6 +185,29 @@ export default function DashboardScreen({ navigation }: any) {
           );
           // 409 = already submitted (synced twice) → treat as success, remove from queue
           if (!res.ok && res.status !== 409) throw new Error(await res.text());
+        } else if (action.type === "ATTENDANCE") {
+          const FileSystem = require("expo-file-system");
+          const base64 = await FileSystem.readAsStringAsync(action.payload.photoUri, {
+            encoding: FileSystem.EncodingType.Base64,
+          });
+
+          const res = await fetch(
+            `${SERVER_BASE}/api/attendance/mark`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                image: base64,
+                action: action.payload.action,
+                captured_at: action.payload.captured_at,
+                job_id: action.payload.job_id
+              }),
+            },
+          );
+          if (!res.ok && res.status !== 409) throw new Error(await res.text());
         }
 
         // ✅ Remove from queue on success and persist immediately
@@ -227,9 +250,15 @@ export default function DashboardScreen({ navigation }: any) {
         JSON.stringify(response.data, null, 2),
       );
       setJobs(response.data.jobs || response.data || []);
+      await AsyncStorage.setItem("@cached_jobs", JSON.stringify(response.data.jobs || response.data || []));
     } catch (error) {
-      console.warn("Backend fetch failed. Displaying empty queue.", error);
-      setJobs([]);
+      console.warn("Backend fetch failed. Displaying cached queue.", error);
+      const cached = await AsyncStorage.getItem("@cached_jobs");
+      if (cached) {
+        setJobs(JSON.parse(cached));
+      } else {
+        setJobs([]);
+      }
     } finally {
       setLoading(false);
       setRefreshing(false);
